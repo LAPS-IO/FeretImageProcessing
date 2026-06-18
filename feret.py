@@ -4,7 +4,8 @@ Given a path to a ``runN`` folder (e.g. ``outputs/run0``), scan every ``*.npz`` 
 ``background_difference_watershed/``, load ``labels`` (uint16), and write one CSV row per
 connected **instance** region (labels 2--65534 only; void/background 0/1 and edges 65535 are
 ignored) with Feret-style maximum diameter (max pairwise distance on the convex hull of the outer
-contour, in pixels) and axis-aligned bounding box. By default a two-pixel **edge band** of labels
+contour) in pixels and micrometers (``diameter_um`` = ``diameter_px`` × ``--um-per-pixel``, default
+13.8 µm/px), plus axis-aligned bounding box. By default a two-pixel **edge band** of labels
 is cleared (``--edge-strip``) to drop spurious border instances that can look like a white frame
 and produce very long Feret chords.
 
@@ -17,7 +18,8 @@ Example: ``2025-04-23_14_30_00.png_-0000123.npz`` → datetime ``2025-04-23 14:3
 Install ``tqdm`` (``pip install tqdm``) for a progress bar.
 
 Use ``--viz-random N`` to save ``N`` randomly chosen label maps as PNGs with Feret diameter lines
-(green) and numeric labels (cyan). Optionally pass ``--viz-original-root DIR`` so each stacked image
+(green) and numeric labels in micrometers (cyan; pixel length × ``--um-per-pixel``, default 13.8).
+Optionally pass ``--viz-original-root DIR`` so each stacked image
 uses the matching ``.jpg`` under ``DIR`` (same subfolders and filenames as ``*.npz``, ``.jpg`` in
 place of ``.npz``). Viz runs **first**. With ``--viz-random``, add ``--csv`` to write the diameter CSV
 for **all** npz files afterward; without ``--viz-random``, the CSV is written by default (viz disabled).
@@ -46,6 +48,9 @@ except ImportError:  # pragma: no cover
 # 2..65534 = instance ids. Feret is computed **only** for instance components, never for 0/1/65535.
 LABEL_INSTANCE_MIN = 2
 LABEL_INSTANCE_MAX = 65534
+
+# Physical length per image pixel (micrometers); multiply Feret diameter in px for viz / ``diameter_um`` CSV.
+DEFAULT_UM_PER_PIXEL = 13.8
 
 # Matches leaf: date_time.rest_depth.npz with signed 7-digit depth
 NAME_RE = re.compile(
@@ -147,18 +152,6 @@ def _line_mask_inside_component(
     return cv2.bitwise_and(line, fg)
 
 
-def _text_anchor_inside_component(comp_u8: np.ndarray) -> tuple[int, int]:
-    """``(x, y)`` for cv2.putText baseline near centroid, forced onto a foreground pixel."""
-    ys, xs = np.where(comp_u8 >= 128)
-    if ys.size == 0:
-        return 12, 12
-    cy = int(np.round(ys.mean()))
-    cx = int(np.round(xs.mean()))
-    if 0 <= cy < comp_u8.shape[0] and 0 <= cx < comp_u8.shape[1] and comp_u8[cy, cx] >= 128:
-        return cx, cy
-    return int(xs[0]), int(ys[0])
-
-
 def _is_instance_label(uid: int) -> bool:
     return LABEL_INSTANCE_MIN <= uid <= LABEL_INSTANCE_MAX
 
@@ -190,7 +183,9 @@ def iter_watershed_npz(run_dir: Path) -> list[Path]:
     return out
 
 
-def process_npz(path: Path, writer: csv.writer, edge_strip_px: int) -> None:
+def process_npz(
+    path: Path, writer: csv.writer, edge_strip_px: int, um_per_pixel: float
+) -> None:
     leaf = path.name
     dt_s, depth = parse_filename(leaf)
 
@@ -205,6 +200,7 @@ def process_npz(path: Path, writer: csv.writer, edge_strip_px: int) -> None:
         diam, top, left, bottom, right, _p1, _p2 = bbox_and_max_hull_diameter(comp)
         if top < 0 or diam <= 0:
             continue
+        diam_um = float(diam) * um_per_pixel
         writer.writerow(
             [
                 dt_s if dt_s is not None else "",
@@ -215,46 +211,78 @@ def process_npz(path: Path, writer: csv.writer, edge_strip_px: int) -> None:
                 bottom,
                 right,
                 f"{diam:.6f}",
+                f"{diam_um:.6f}",
             ]
         )
 
 
-def draw_feret_overlays_bgr(vis: np.ndarray, lab: np.ndarray) -> None:
+def draw_feret_overlays_bgr(
+    vis: np.ndarray,
+    lab: np.ndarray,
+    *,
+    um_per_pixel: float = DEFAULT_UM_PER_PIXEL,
+) -> None:
     """
-    Draw Feret chords (green) and diameter labels (cyan) onto ``vis`` (BGR, same H×W as ``lab``).
+    Draw Feret chords (green) and diameter labels in micrometers (cyan) onto ``vis``
+    (BGR, same H×W as ``lab``). Labels are centered horizontally on each component’s
+    bounding box; with 50% probability the text is placed just **above** the top edge,
+    otherwise just **below** the bottom edge. Text uses ``diameter_px * um_per_pixel``.
     ``lab`` must already include any edge-strip preprocessing (call ``prepare_labels_for_feret`` first).
     """
     th = max(1, min(lab.shape) // 400 + 1)
+    ih, iw = vis.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    # Readable on large frames (was 0.35 px — effectively invisible on ~2k–4k images).
+    font_scale = 0.5*max(0.7, min(2.5, min(ih, iw) / 500.0))
+    font_th = max(1, min(4, int(round(font_scale * 1.8))))
     for comp in iter_instance_components(lab):
-        diam, _t, _l, _b, _r, p1, p2 = bbox_and_max_hull_diameter(comp)
+        diam, top, left, bottom, right, p1, p2 = bbox_and_max_hull_diameter(comp)
         if diam <= 0 or p1[0] < 0 or p2[0] < 0:
             continue
         lm = _line_mask_inside_component(comp, p1, p2, th)
         vis[lm > 0] = (0, 255, 0)
-        cx, cy = _text_anchor_inside_component(comp)
-        label = f"{diam:.1f}px"
-        tx = max(2, min(vis.shape[1] - 80, cx - 35))
-        ty = max(12, min(vis.shape[0] - 2, cy))
-        if (
-            ty < comp.shape[0]
-            and tx < comp.shape[1]
-            and ty >= 0
-            and tx >= 0
-            and comp[ty, tx] >= 128
-        ):
-            cv2.putText(
-                vis,
-                label,
-                (tx, ty),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.35,
-                (0, 255, 255),
-                1,
-                cv2.LINE_AA,
+        cx_bb = (int(left) + int(right)) // 2
+        diam_um = float(diam) * um_per_pixel
+        label = f"{diam_um:.1f} um"
+        (tw, th_txt), bl = cv2.getTextSize(label, font, font_scale, font_th)
+        tx = int(np.clip(cx_bb - tw // 2, 0, max(0, iw - tw - 1)))
+        gap = max(6, int(round(font_scale * 8)))
+        # ``putText`` ``y`` = baseline; glyph extent ~ [y - th_txt + bl, y + bl].
+        if random.random() < 0.5:
+            ty = int(np.clip(int(top) - gap - bl, th_txt, ih - 1))
+        else:
+            ty = int(
+                np.clip(int(bottom) + gap + th_txt + bl, th_txt + bl, ih - 1)
             )
+        # Outline so cyan reads on both light and dark backgrounds.
+        cv2.putText(
+            vis,
+            label,
+            (tx, ty),
+            font,
+            font_scale,
+            (0, 0, 0),
+            font_th + 2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            vis,
+            label,
+            (tx, ty),
+            font,
+            font_scale,
+            (0, 255, 255),
+            font_th,
+            cv2.LINE_AA,
+        )
 
 
-def render_binary_with_diameters(lab: np.ndarray, edge_strip_px: int) -> np.ndarray:
+def render_binary_with_diameters(
+    lab: np.ndarray,
+    edge_strip_px: int,
+    *,
+    um_per_pixel: float = DEFAULT_UM_PER_PIXEL,
+) -> np.ndarray:
     """Binary instance mask (white on black BGR); Feret lines/text only on instance pixels."""
     lab = prepare_labels_for_feret(lab, edge_strip_px)
     inst = (
@@ -262,11 +290,17 @@ def render_binary_with_diameters(lab: np.ndarray, edge_strip_px: int) -> np.ndar
         & (lab <= LABEL_INSTANCE_MAX)
     ).astype(np.uint8) * 255
     vis = cv2.cvtColor(inst, cv2.COLOR_GRAY2BGR)
-    draw_feret_overlays_bgr(vis, lab)
+    draw_feret_overlays_bgr(vis, lab, um_per_pixel=um_per_pixel)
     return vis
 
 
-def render_on_original_bgr(base_bgr: np.ndarray, lab: np.ndarray, edge_strip_px: int) -> np.ndarray:
+def render_on_original_bgr(
+    base_bgr: np.ndarray,
+    lab: np.ndarray,
+    edge_strip_px: int,
+    *,
+    um_per_pixel: float = DEFAULT_UM_PER_PIXEL,
+) -> np.ndarray:
     """Resize ``base_bgr`` to label size if needed, then draw Feret overlays."""
     lab = prepare_labels_for_feret(lab, edge_strip_px)
     h, w = lab.shape[:2]
@@ -279,7 +313,7 @@ def render_on_original_bgr(base_bgr: np.ndarray, lab: np.ndarray, edge_strip_px:
         vis = vis[:, :, :3].copy()
     if vis.shape[0] != h or vis.shape[1] != w:
         vis = cv2.resize(vis, (w, h), interpolation=cv2.INTER_LINEAR)
-    draw_feret_overlays_bgr(vis, lab)
+    draw_feret_overlays_bgr(vis, lab, um_per_pixel=um_per_pixel)
     return vis
 
 
@@ -372,6 +406,16 @@ def main() -> None:
             "Reduces spurious border segments that cause full-image diagonals. Use 0 to disable."
         ),
     )
+    parser.add_argument(
+        "--um-per-pixel",
+        type=float,
+        default=DEFAULT_UM_PER_PIXEL,
+        metavar="U",
+        help=(
+            "Micrometers per image pixel: viz text and CSV ``diameter_um`` = Feret diameter (px) × U "
+            f"(default: {DEFAULT_UM_PER_PIXEL})."
+        ),
+    )
     args = parser.parse_args()
 
     run_dir = args.run_dir.resolve()
@@ -380,6 +424,10 @@ def main() -> None:
         sys.exit(1)
     if int(args.edge_strip) < 0:
         print("--edge-strip must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    um_pp = float(args.um_per_pixel)
+    if um_pp <= 0:
+        print("--um-per-pixel must be > 0", file=sys.stderr)
         sys.exit(1)
 
     viz_orig = args.viz_original_root
@@ -440,15 +488,17 @@ def main() -> None:
                         f"{p}: missing or unreadable JPEG {jpg_path}, using binary viz",
                         file=sys.stderr,
                     )
-                    img = render_binary_with_diameters(lab, esp)
+                    img = render_binary_with_diameters(lab, esp, um_per_pixel=um_pp)
                 else:
                     try:
-                        img = render_on_original_bgr(base, lab, esp)
+                        img = render_on_original_bgr(
+                            base, lab, esp, um_per_pixel=um_pp
+                        )
                     except ValueError as e:
                         print(f"{p}: {e}; using binary viz", file=sys.stderr)
-                        img = render_binary_with_diameters(lab, esp)
+                        img = render_binary_with_diameters(lab, esp, um_per_pixel=um_pp)
             else:
-                img = render_binary_with_diameters(lab, esp)
+                img = render_binary_with_diameters(lab, esp, um_per_pixel=um_pp)
             outp = viz_npz_path_to_png_path(p, ws_root, viz_dir)
             outp.parent.mkdir(parents=True, exist_ok=True)
             if not cv2.imwrite(str(outp), img):
@@ -470,13 +520,14 @@ def main() -> None:
                     "left",
                     "bottom",
                     "right",
-                    "diameter",
+                    "diameter_px",
+                    "diameter_um",
                 ]
             )
             esp = int(args.edge_strip)
             for p in tqdm(paths, desc="Watershed npz", unit="file"):
                 try:
-                    process_npz(p, w, esp)
+                    process_npz(p, w, esp, um_pp)
                 except Exception as e:
                     print(f"{p}: {e}", file=sys.stderr)
                     sys.exit(1)

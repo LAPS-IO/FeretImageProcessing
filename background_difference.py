@@ -3,12 +3,20 @@
 For each date folder, either sample N random images (mean or median) to build one background,
 or with --rolling use a per-image mean of the W files before/after in the same directory
 (filename order). Then save max(0, image - background) for each file.
-Layout: <output>/background_difference/<relpath_from_root>/
-Optional: with --bboxes, also <output>/background_difference_otsu_bboxes/ (invert diff, Otsu, boxes
-on the original image; components with area < 100 are skipped; 100..999 yellow, 1000+ green).
+Layout: <output>/background_difference/<relpath_from_root>/ and the same relpath under
+<output>/background_difference_background/ for the background image used for that frame.
+Optional: with --bboxes, also <output>/background_difference_otsu_bboxes/ (after full watershed,
+one axis-aligned box per instance label ``>= 2`` on the original: 100..999 px yellow, 1000+ green,
+each bbox expanded by ``BBOX_OUTWARD_MARGIN_PX`` per side, clipped; instances with area < 100 skipped).
 Use --no-diff to skip writing the diff image folder; requires --bboxes.
 With --bboxes --bboxes-side-by-side, also save a half-size diff | original+bboxes image to
 <output>/runN/background_difference_otsu_bboxes_side_by_side/.
+Use -v / --verbose for stderr progress, including per-step watershed timings and slow-loop progress.
+With --min-pool2, pad to even H×W (edge replicate), 2×2 min-pool **image** and **background**, run the
+pipeline at half resolution, then replicate each pixel to 2×2 (no interpolation) and crop to the
+original size for all saved outputs; watershed side-by-side uses the full-res frame on the left.
+With --watershed-seeds, save initial marker maps (green=fg seed, red=bg seed, else original) under
+<output>/runN/background_difference_watershed_seeds/.
 """
 
 from __future__ import annotations
@@ -19,6 +27,7 @@ import random
 import re
 import shlex
 import sys
+import time
 from pathlib import Path
 from typing import List, Literal, Optional, Sequence, Tuple
 
@@ -39,6 +48,11 @@ IMAGE_EXTENSIONS = {
     ".ppm",
 }
 Method = Literal["mean", "median"]
+
+
+def _vlog(verbose: bool, msg: str, indent: str = "      ") -> None:
+    if verbose:
+        print(f"{indent}{msg}", file=sys.stderr, flush=True)
 
 
 def _group_images_by_parent(paths: List[Path]) -> dict[Path, List[Path]]:
@@ -134,6 +148,66 @@ def _diff_nonnegative(
     return np.clip(np.round(d), 0, 255).astype(np.uint8)
 
 
+def _pad_to_even_hw(bgr: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int]]:
+    """Pad bottom/right with replicate so H and W are even. Returns (padded, (orig_h, orig_w))."""
+    h, w = bgr.shape[:2]
+    orig = (h, w)
+    ph = (2 - h % 2) % 2
+    pw = (2 - w % 2) % 2
+    if ph == 0 and pw == 0:
+        return bgr, orig
+    return cv2.copyMakeBorder(bgr, 0, ph, 0, pw, cv2.BORDER_REPLICATE), orig
+
+
+def _min_pool2x2(bgr: np.ndarray) -> np.ndarray:
+    """Non-overlapping 2×2 blocks → one pixel (min over the 4). H and W must be even."""
+    h, w = bgr.shape[:2]
+    if h % 2 or w % 2:
+        raise ValueError(f"_min_pool2x2 needs even H,W, got {h}×{w}")
+    if bgr.ndim == 2:
+        return bgr.reshape(h // 2, 2, w // 2, 2).min(axis=(1, 3))
+    c = bgr.shape[2]
+    return bgr.reshape(h // 2, 2, w // 2, 2, c).min(axis=(1, 3))
+
+
+def _min_pool2_pair(
+    img: np.ndarray, background: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
+    """
+    Pad to even size, 2×2 min-pool **img** and **background** (same geometry), return
+    (img_pooled, bg_pooled, orig_hw) with orig_hw = (H, W) before pad (for later crop).
+    """
+    if img.shape != background.shape:
+        raise ValueError("img and background must match shape for min-pool")
+    ip, orig_hw = _pad_to_even_hw(img)
+    bp, orig_bg = _pad_to_even_hw(background)
+    if orig_hw != orig_bg:
+        raise ValueError("internal: orig_hw mismatch after pad")
+    if ip.shape != bp.shape:
+        raise ValueError("internal: padded shapes differ")
+    return _min_pool2x2(ip), _min_pool2x2(bp), orig_hw
+
+
+def _replicate_upscale2x_crop(
+    arr: np.ndarray, orig_hw: Tuple[int, int]
+) -> np.ndarray:
+    """Each pixel → 2×2 block (no interpolation); crop to orig_hw (top-left region)."""
+    oh, ow = orig_hw
+    if arr.ndim == 2:
+        up = np.repeat(np.repeat(arr, 2, axis=0), 2, axis=1)
+        return np.ascontiguousarray(up[:oh, :ow])
+    up = np.repeat(np.repeat(arr, 2, axis=0), 2, axis=1)
+    return np.ascontiguousarray(up[:oh, :ow, :])
+
+
+def _maybe_replicate_upscale2x(
+    arr: np.ndarray, orig_hw: Optional[Tuple[int, int]]
+) -> np.ndarray:
+    if orig_hw is None:
+        return arr
+    return _replicate_upscale2x_crop(arr, orig_hw)
+
+
 def _bgr_by_component_area(area: int) -> Tuple[int, int, int]:
     """BBox color (BGR) for components >= 100 px: 100..999 yellow, 1000+ green."""
     if area < 1000:
@@ -141,42 +215,8 @@ def _bgr_by_component_area(area: int) -> Tuple[int, int, int]:
     return (0, 255, 0)
 
 
-def _otsu_bboxes_viz(
-    diff_bgr: np.ndarray,
-    orig_bgr: np.ndarray,
-    *,
-    fixed_threshold: Optional[int] = None,
-) -> np.ndarray:
-    if diff_bgr.shape[:2] != orig_bgr.shape[:2]:
-        raise ValueError(
-            f"diff and original must match in size, got {diff_bgr.shape} vs {orig_bgr.shape}"
-        )
-    if diff_bgr.ndim == 2:
-        gray = diff_bgr
-    else:
-        gray = cv2.cvtColor(diff_bgr, cv2.COLOR_BGR2GRAY)
-    vis = orig_bgr.copy()
-    if fixed_threshold is None:
-        _, binary = cv2.threshold(
-            gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-        )
-    else:
-        _, binary = cv2.threshold(
-            gray, fixed_threshold, 255, cv2.THRESH_BINARY
-        )
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(
-        binary, connectivity=8, ltype=cv2.CV_32S
-    )
-    for i in range(1, n):
-        x, y, w, h, area = stats[i, :5].tolist()
-        a = int(area)
-        if a < 100:
-            continue
-        color = _bgr_by_component_area(a)
-        cv2.rectangle(
-            vis, (x, y), (x + w - 1, y + h - 1), color, thickness=2, lineType=cv2.LINE_8
-        )
-    return vis
+# Outward expansion (per side) for ``--bboxes`` rectangles (watershed instance bboxes).
+BBOX_OUTWARD_MARGIN_PX: int = 10
 
 
 def _to_bgr3(x: np.ndarray) -> np.ndarray:
@@ -252,7 +292,7 @@ def _refine_merged_watershed_for_morph(
 
 
 def _remove_small_watershed_instances(
-    m_viz: np.ndarray, min_area: int
+    m_viz: np.ndarray, min_area: int, *, verbose: bool = False
 ) -> np.ndarray:
     """
     Drop instance labels (ids ``>= 2``) with pixel count below ``min_area`` (reassign to ``1``);
@@ -261,9 +301,14 @@ def _remove_small_watershed_instances(
     if min_area <= 0:
         return m_viz
     m = m_viz.copy()
-    for lab in np.unique(m):
-        if int(lab) < 2:
-            continue
+    labels = [int(x) for x in np.unique(m) if int(x) >= 2]
+    n_inst = len(labels)
+    if verbose and n_inst:
+        _vlog(verbose, f"remove small instances: checking {n_inst} ids (min_area={min_area})")
+    step = max(1, n_inst // 25) if n_inst > 25 else 1
+    for j, lab in enumerate(labels):
+        if verbose and (j == 0 or (j + 1) % step == 0 or j == n_inst - 1):
+            _vlog(verbose, f"remove small: instance {j + 1}/{n_inst} (label {lab})")
         mask = m == lab
         if int(np.count_nonzero(mask)) < min_area:
             m[mask] = 1
@@ -314,7 +359,9 @@ def _fg_fg_4n_edge_mask(merged: np.ndarray) -> np.ndarray:
     return e
 
 
-def _merge_watershed_labels_by_cc8(m_out: np.ndarray) -> np.ndarray:
+def _merge_watershed_labels_by_cc8(
+    m_out: np.ndarray, *, verbose: bool = False
+) -> np.ndarray:
     """
     Merge watershed output by turning it into a single binary image, then
     8-CC: foreground OR old watershed line (``-1``) is 1, else 0. That way
@@ -329,9 +376,19 @@ def _merge_watershed_labels_by_cc8(m_out: np.ndarray) -> np.ndarray:
     n, cc = cv2.connectedComponents(
         binary_u8, connectivity=8, ltype=cv2.CV_32S
     )
+    n_fg = n - 1
+    if verbose:
+        h, w = m_out.shape[:2]
+        _vlog(
+            verbose,
+            f"merge CC8: {n_fg} components on {w}×{h} (remap loop can be slow if N is large)",
+        )
     merged = np.ones(m_out.shape, dtype=np.int32)
     merged[m_out == 0] = 0
+    step = max(500, n_fg // 20) if n_fg > 500 else max(1, n_fg // 5) if n_fg > 5 else 1
     for k in range(1, n):
+        if verbose and n_fg > 1 and (k == 1 or k % step == 0 or k == n - 1):
+            _vlog(verbose, f"merge CC8: remap component {k}/{n_fg}")
         merged[cc == k] = k + 1
     merged[_fg_fg_4n_edge_mask(merged)] = -1
     return merged
@@ -341,12 +398,24 @@ def _merge_watershed_labels_by_cc8(m_out: np.ndarray) -> np.ndarray:
 WATERSHED_LABEL_BOUNDARY_U16: np.uint16 = np.uint16(65535)
 
 
-def _overlay_watershed_merged(bgr: np.ndarray, m_viz: np.ndarray, alpha: float = 0.5) -> np.ndarray:
+def _overlay_watershed_merged(
+    bgr: np.ndarray,
+    m_viz: np.ndarray,
+    alpha: float = 0.5,
+    *,
+    verbose: bool = False,
+) -> np.ndarray:
     """Colorized overlay (BGR) for side-by-side and visualization."""
     base = bgr.astype(np.float32)
     overlay = base.copy()
     mmax = int(np.max(m_viz[m_viz > 0])) if np.any(m_viz > 0) else 1
+    n_col = max(0, mmax - 1)
+    if verbose and n_col > 0:
+        _vlog(verbose, f"overlay: tinting up to {n_col} instance label(s) (max id {mmax})")
+    step = max(200, n_col // 25) if n_col > 200 else max(1, n_col // 5) if n_col > 5 else 1
     for lab in range(2, mmax + 1):
+        if verbose and n_col > 1 and (lab == 2 or (lab - 1) % step == 0 or lab == mmax):
+            _vlog(verbose, f"overlay: label {lab}/{mmax}")
         sel = m_viz == lab
         if not np.any(sel):
             continue
@@ -379,6 +448,123 @@ def _merged_labels_to_uint16(m_viz: np.ndarray) -> np.ndarray:
     return a.astype(np.uint16)
 
 
+def _watershed_instance_bboxes_viz(
+    labels_u16: np.ndarray,
+    orig_bgr: np.ndarray,
+    *,
+    outward_margin_px: int = BBOX_OUTWARD_MARGIN_PX,
+    min_area_px: int = 100,
+) -> np.ndarray:
+    """
+    Draw axis-aligned boxes on ``orig_bgr`` for each watershed instance (label ``>= 2``,
+    excluding :data:`WATERSHED_LABEL_BOUNDARY_U16`), after the full watershed pipeline.
+    Colors match :func:`_bgr_by_component_area` (segmentation convention). Boxes are expanded
+    by ``outward_margin_px`` per side and clipped to the image.
+    """
+    if labels_u16.shape[:2] != orig_bgr.shape[:2]:
+        raise ValueError(
+            f"labels and original must match in size, got {labels_u16.shape} vs {orig_bgr.shape}"
+        )
+    vis = orig_bgr.copy()
+    H, W = vis.shape[:2]
+    m = int(max(0, outward_margin_px))
+    bnd = int(WATERSHED_LABEL_BOUNDARY_U16)
+    ids = [
+        int(u)
+        for u in np.unique(labels_u16)
+        if int(u) >= 2 and int(u) != bnd
+    ]
+    for lid in ids:
+        mask = labels_u16 == np.uint16(lid)
+        area = int(np.count_nonzero(mask))
+        if area < min_area_px:
+            continue
+        ys, xs = np.where(mask)
+        y0, y1 = int(ys.min()), int(ys.max())
+        x0, x1 = int(xs.min()), int(xs.max())
+        rx0 = max(0, x0 - m)
+        ry0 = max(0, y0 - m)
+        rx1 = min(W - 1, x1 + m)
+        ry1 = min(H - 1, y1 + m)
+        color = _bgr_by_component_area(area)
+        cv2.rectangle(
+            vis, (rx0, ry0), (rx1, ry1), color, thickness=2, lineType=cv2.LINE_8
+        )
+    return vis
+
+
+# BGR for :func:`watershed_seeds_visualization_bgr` (red = sure background seed, green = fg seed).
+_WATERSHED_SEED_BG_BGR: Tuple[int, int, int] = (0, 0, 255)
+_WATERSHED_SEED_FG_BGR: Tuple[int, int, int] = (0, 255, 0)
+
+
+def _watershed_markers_int32_from_gray(
+    gray: np.ndarray, t: int
+) -> Tuple[np.ndarray, bool]:
+    """
+    Build the initial ``markers`` image passed to :func:`cv2.watershed`:
+    ``0`` = unknown, ``1`` = sure background seed, ``>= 2`` = foreground seeds
+    (connected components of eroded fg, or raw fg if eroded mask is empty).
+
+    Returns
+    -------
+    markers : ndarray
+        int32, same shape as ``gray``.
+    has_fg : bool
+        True iff ``gray > t`` anywhere (same condition as running full watershed).
+    """
+    t = int(np.clip(t, 0, 255))
+    h, w = gray.shape
+    fg = (gray > t).astype(np.uint8) * 255
+    has_fg = bool(np.any(fg))
+    markers = np.zeros((h, w), dtype=np.int32)
+    bg_sure = gray == 0
+    if np.any(bg_sure):
+        markers[bg_sure] = 1
+    else:
+        markers[0, :] = 1
+        markers[-1, :] = 1
+        markers[:, 0] = 1
+        markers[:, -1] = 1
+    in_between = (gray > 0) & (gray <= t)
+    markers[in_between] = 0
+    if not has_fg:
+        return markers, False
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    fg_seed = cv2.erode(fg, kernel, iterations=1)
+    n, m = cv2.connectedComponents(fg_seed, connectivity=8, ltype=cv2.CV_32S)
+    for lab in range(1, n):
+        markers[m == lab] = lab + 1
+    if not np.any(fg_seed) and np.any(fg):
+        n2, m2 = cv2.connectedComponents(fg, connectivity=8, ltype=cv2.CV_32S)
+        for lab in range(1, n2):
+            markers[(m2 == lab)] = lab + 1
+    return markers, True
+
+
+def watershed_seeds_visualization_bgr(
+    orig_bgr: np.ndarray,
+    diff_bgr: np.ndarray,
+    t: int,
+) -> np.ndarray:
+    """
+    RGB/BGR view of **initial** watershed seeds on top of the original frame:
+    green = foreground seed pixels, red = background seed pixels, unchanged BGR elsewhere (unknown).
+    """
+    bgr = _to_bgr3(orig_bgr) if orig_bgr.ndim == 2 else orig_bgr
+    if diff_bgr.shape[:2] != bgr.shape[:2]:
+        raise ValueError("diff and orig must share H, W for watershed seeds")
+    if diff_bgr.ndim == 2:
+        gray = diff_bgr.astype(np.uint8, copy=False)
+    else:
+        gray = cv2.cvtColor(diff_bgr, cv2.COLOR_BGR2GRAY)
+    markers, _ = _watershed_markers_int32_from_gray(gray, t)
+    vis = bgr.copy()
+    vis[markers == 1] = _WATERSHED_SEED_BG_BGR
+    vis[markers >= 2] = _WATERSHED_SEED_FG_BGR
+    return vis
+
+
 def watershed_from_diff_threshold(
     orig_bgr: np.ndarray,
     diff_bgr: np.ndarray,
@@ -387,6 +573,8 @@ def watershed_from_diff_threshold(
     circular_morph_dilate_iter: int = 1,
     circular_morph_erode_iter: int = 1,
     watershed_min_area: int = 100,
+    *,
+    verbose: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Pixels on diff (grayscale) with value > t → foreground, value == 0 → background;
@@ -417,50 +605,74 @@ def watershed_from_diff_threshold(
     else:
         gray = cv2.cvtColor(diff_bgr, cv2.COLOR_BGR2GRAY)
 
-    t = int(np.clip(t, 0, 255))
-    fg = (gray > t).astype(np.uint8) * 255
     h, w = gray.shape
-    if not np.any(fg):
+    if verbose:
+        _vlog(
+            verbose,
+            f"watershed: {w}×{h} px, T={int(np.clip(t, 0, 255))}, min_area={watershed_min_area}",
+        )
+    t0 = time.perf_counter()
+    markers, has_fg = _watershed_markers_int32_from_gray(gray, t)
+    if not has_fg:
+        if verbose:
+            _vlog(verbose, "watershed: no foreground (diff > T); return trivial labels")
         labels_fill = np.ones((h, w), dtype=np.uint16)
         return bgr.copy(), labels_fill
-    bg_sure = gray == 0
-    markers = np.zeros((h, w), dtype=np.int32)
-    if np.any(bg_sure):
-        markers[bg_sure] = 1
-    else:
-        markers[0, :] = 1
-        markers[-1, :] = 1
-        markers[:, 0] = 1
-        markers[:, -1] = 1
-    in_between = (gray > 0) & (gray <= t)
-    markers[in_between] = 0
+    if verbose:
+        mx = int(markers.max())
+        _vlog(
+            verbose,
+            f"watershed: markers ready ({time.perf_counter() - t0:.2f}s, fg seed ids up to {mx})",
+        )
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    fg_seed = cv2.erode(fg, kernel, iterations=1)
-    n, m = cv2.connectedComponents(fg_seed, connectivity=8, ltype=cv2.CV_32S)
-    for lab in range(1, n):
-        sel = m == lab
-        markers[sel] = lab + 1
-    if not np.any(fg_seed) and np.any(fg):
-        n2, m2 = cv2.connectedComponents(fg, connectivity=8, ltype=cv2.CV_32S)
-        for lab in range(1, n2):
-            markers[(m2 == lab)] = lab + 1
-
+    if verbose:
+        _vlog(verbose, "watershed: cv2.watershed (often the slowest step) …")
+    t_ws = time.perf_counter()
     ws = bgr.copy()
     m_out = cv2.watershed(ws, markers)
-    m_viz = _merge_watershed_labels_by_cc8(m_out)
+    if verbose:
+        _vlog(verbose, f"watershed: cv2.watershed done ({time.perf_counter() - t_ws:.2f}s)")
+
+    t_merge = time.perf_counter()
+    m_viz = _merge_watershed_labels_by_cc8(m_out, verbose=verbose)
+    if verbose:
+        _vlog(verbose, f"watershed: merge CC8 total ({time.perf_counter() - t_merge:.2f}s)")
+
     r = circular_morph_radius
     du, eu = int(circular_morph_dilate_iter), int(circular_morph_erode_iter)
     if r is not None and r >= 1 and (du > 0 or eu > 0):
+        if verbose:
+            _vlog(
+                verbose,
+                f"watershed: circular morph r={r} dilate={du} erode={eu} …",
+            )
+        t_m = time.perf_counter()
         b0 = _binary_from_merged_watershed_labels(m_viz)
         b1 = _circular_morph_dilate_erode_u8(b0, r, du, eu)
         if not np.array_equal(b0, b1):
             m_viz = _refine_merged_watershed_for_morph(m_viz, b1)
+        if verbose:
+            _vlog(verbose, f"watershed: circular morph done ({time.perf_counter() - t_m:.2f}s)")
+    t_small = time.perf_counter()
     m_viz = _remove_small_watershed_instances(
-        m_viz, int(watershed_min_area)
+        m_viz, int(watershed_min_area), verbose=verbose
     )
-    overlay = _overlay_watershed_merged(bgr, m_viz)
+    if verbose:
+        _vlog(
+            verbose,
+            f"watershed: remove small instances done ({time.perf_counter() - t_small:.2f}s)",
+        )
+    t_ov = time.perf_counter()
+    overlay = _overlay_watershed_merged(bgr, m_viz, verbose=verbose)
+    if verbose:
+        _vlog(verbose, f"watershed: overlay done ({time.perf_counter() - t_ov:.2f}s)")
+    t_u16 = time.perf_counter()
     labels_u16 = _merged_labels_to_uint16(m_viz)
+    if verbose:
+        _vlog(
+            verbose,
+            f"watershed: uint16 labels ({time.perf_counter() - t_u16:.2f}s)",
+        )
     return overlay, labels_u16
 
 
@@ -478,13 +690,14 @@ def _process_one_image(
     root: Path,
     img: np.ndarray,
     img_path: Path,
+    background: np.ndarray,
     diff: np.ndarray,
     out_base: Path | None,
+    bg_out_base: Path | None,
     bbox_base: Path | None,
     bbox_sbs_base: Path | None,
     save_otsu_bboxes: bool,
     save_otsu_bboxes_side_by_side: bool,
-    bbox_fixed_threshold: Optional[int],
     save_watershed: bool,
     save_watershed_side_by_side: bool,
     watershed_t: int,
@@ -494,29 +707,42 @@ def _process_one_image(
     watershed_min_area: int,
     ws_base: Path | None,
     ws_sbs_base: Path | None,
+    save_watershed_seeds: bool,
+    ws_seeds_base: Path | None,
+    verbose: bool = False,
+    orig_hw_pool_restore: Optional[Tuple[int, int]] = None,
+    img_fullres: Optional[np.ndarray] = None,
 ) -> None:
     rel = img_path.relative_to(root)
     if out_base is not None:
+        if verbose:
+            _vlog(verbose, f"write diff + background ({rel}) …")
+        t0 = time.perf_counter()
         dest = out_base / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
-        if not cv2.imwrite(str(dest), diff):
+        diff_out = _maybe_replicate_upscale2x(diff, orig_hw_pool_restore)
+        if not cv2.imwrite(str(dest), diff_out):
             raise RuntimeError(f"Failed to write: {dest}")
-    if save_otsu_bboxes or save_otsu_bboxes_side_by_side:
-        bviz = _otsu_bboxes_viz(diff, img, fixed_threshold=bbox_fixed_threshold)
-        if bbox_base is not None:
-            bdest = bbox_base / rel
-            bdest.parent.mkdir(parents=True, exist_ok=True)
-            if not cv2.imwrite(str(bdest), bviz):
-                raise RuntimeError(f"Failed to write: {bdest}")
-        if bbox_sbs_base is not None:
-            sbs = _downscale_side_by_side_half(
-                _hstack_diff_and_bbox_viz(diff, bviz)
-            )
-            sdest = bbox_sbs_base / rel
-            sdest.parent.mkdir(parents=True, exist_ok=True)
-            if not cv2.imwrite(str(sdest), sbs):
-                raise RuntimeError(f"Failed to write: {sdest}")
-    if save_watershed or save_watershed_side_by_side:
+        if bg_out_base is not None:
+            bg_dest = bg_out_base / rel
+            bg_dest.parent.mkdir(parents=True, exist_ok=True)
+            bg_out = _maybe_replicate_upscale2x(background, orig_hw_pool_restore)
+            if not cv2.imwrite(str(bg_dest), bg_out):
+                raise RuntimeError(f"Failed to write: {bg_dest}")
+        if verbose:
+            _vlog(verbose, f"write diff + background done ({time.perf_counter() - t0:.2f}s)")
+    need_watershed = (
+        save_watershed
+        or save_watershed_side_by_side
+        or save_otsu_bboxes
+        or save_otsu_bboxes_side_by_side
+    )
+    wvis: Optional[np.ndarray] = None
+    wlab: Optional[np.ndarray] = None
+    if need_watershed:
+        if verbose:
+            _vlog(verbose, "watershed pipeline …")
+        t_ws_all = time.perf_counter()
         wvis, wlab = watershed_from_diff_threshold(
             img,
             diff,
@@ -525,22 +751,84 @@ def _process_one_image(
             circular_morph_dilate_iter=circular_morph_dilate_iter,
             circular_morph_erode_iter=circular_morph_erode_iter,
             watershed_min_area=watershed_min_area,
+            verbose=verbose,
         )
-        if save_watershed and ws_base is not None:
-            wpath = (ws_base / rel).with_suffix(".npz")
-            wpath.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                np.savez_compressed(wpath, labels=wlab)
-            except OSError as e:
-                raise RuntimeError(f"Failed to write: {wpath}") from e
-        if save_watershed_side_by_side and ws_sbs_base is not None:
-            sbs = _downscale_side_by_side_half(
-                _hstack_orig_and_watershed(img, wvis)
+        if verbose:
+            _vlog(
+                verbose,
+                f"watershed pipeline done ({time.perf_counter() - t_ws_all:.2f}s total)",
             )
-            sp = ws_sbs_base / rel
-            sp.parent.mkdir(parents=True, exist_ok=True)
-            if not cv2.imwrite(str(sp), sbs):
-                raise RuntimeError(f"Failed to write: {sp}")
+    if save_otsu_bboxes or save_otsu_bboxes_side_by_side:
+        if verbose:
+            _vlog(verbose, "instance bboxes (watershed labels, +margin) …")
+        t0 = time.perf_counter()
+        if wlab is None:
+            raise RuntimeError("internal: watershed labels missing for --bboxes")
+        bviz = _watershed_instance_bboxes_viz(wlab, img)
+        bviz_out = _maybe_replicate_upscale2x(bviz, orig_hw_pool_restore)
+        if bbox_base is not None:
+            bdest = bbox_base / rel
+            bdest.parent.mkdir(parents=True, exist_ok=True)
+            if not cv2.imwrite(str(bdest), bviz_out):
+                raise RuntimeError(f"Failed to write: {bdest}")
+        if bbox_sbs_base is not None:
+            diff_sbs = _maybe_replicate_upscale2x(diff, orig_hw_pool_restore)
+            sbs = _downscale_side_by_side_half(
+                _hstack_diff_and_bbox_viz(diff_sbs, bviz_out)
+            )
+            sdest = bbox_sbs_base / rel
+            sdest.parent.mkdir(parents=True, exist_ok=True)
+            if not cv2.imwrite(str(sdest), sbs):
+                raise RuntimeError(f"Failed to write: {sdest}")
+        if verbose:
+            _vlog(
+                verbose,
+                f"instance bboxes done ({time.perf_counter() - t0:.2f}s)",
+            )
+    if save_watershed and ws_base is not None:
+        if wlab is None or wvis is None:
+            raise RuntimeError("internal: watershed outputs missing for --watershed")
+        if verbose:
+            _vlog(verbose, f"write watershed .npz ({rel}) …")
+        t_npz = time.perf_counter()
+        wpath = (ws_base / rel).with_suffix(".npz")
+        wpath.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            wlab_out = _maybe_replicate_upscale2x(wlab, orig_hw_pool_restore)
+            np.savez_compressed(wpath, labels=wlab_out)
+        except OSError as e:
+            raise RuntimeError(f"Failed to write: {wpath}") from e
+        if verbose:
+            _vlog(verbose, f"write .npz done ({time.perf_counter() - t_npz:.2f}s)")
+    if save_watershed_side_by_side and ws_sbs_base is not None:
+        if wvis is None:
+            raise RuntimeError("internal: watershed viz missing for side-by-side")
+        if verbose:
+            _vlog(verbose, "side-by-side downscale + write …")
+        t_sbs = time.perf_counter()
+        img_left = img_fullres if img_fullres is not None else img
+        wvis_out = _maybe_replicate_upscale2x(wvis, orig_hw_pool_restore)
+        sbs = _downscale_side_by_side_half(
+            _hstack_orig_and_watershed(img_left, wvis_out)
+        )
+        sp = ws_sbs_base / rel
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        if not cv2.imwrite(str(sp), sbs):
+            raise RuntimeError(f"Failed to write: {sp}")
+        if verbose:
+            _vlog(verbose, f"side-by-side done ({time.perf_counter() - t_sbs:.2f}s)")
+    if save_watershed_seeds and ws_seeds_base is not None:
+        if verbose:
+            _vlog(verbose, "watershed seeds (red=bg, green=fg, else original) …")
+        t_sd = time.perf_counter()
+        seeds_bgr = watershed_seeds_visualization_bgr(img, diff, watershed_t)
+        seeds_out = _maybe_replicate_upscale2x(seeds_bgr, orig_hw_pool_restore)
+        sdest = ws_seeds_base / rel
+        sdest.parent.mkdir(parents=True, exist_ok=True)
+        if not cv2.imwrite(str(sdest), seeds_out):
+            raise RuntimeError(f"Failed to write: {sdest}")
+        if verbose:
+            _vlog(verbose, f"watershed seeds done ({time.perf_counter() - t_sd:.2f}s)")
 
 
 def run(
@@ -553,22 +841,39 @@ def run(
     save_diff: bool = True,
     save_otsu_bboxes: bool = False,
     save_otsu_bboxes_side_by_side: bool = False,
-    bbox_fixed_threshold: Optional[int] = None,
     save_watershed: bool = False,
     save_watershed_side_by_side: bool = False,
+    save_watershed_seeds: bool = False,
     watershed_t: int = 8,
     circular_morph_radius: Optional[int] = None,
     circular_morph_dilate_iter: int = 1,
     circular_morph_erode_iter: int = 1,
     watershed_min_area: int = 100,
+    verbose: bool = False,
+    min_pool2: bool = False,
 ) -> None:
     root = root.resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"Root is not a directory: {root}")
+    processed = 0
+    if verbose:
+        if use_rolling:
+            cfg = f"rolling half-width={rolling_half}"
+        else:
+            cfg = f"method={method} n_images={n}"
+        print(
+            f"background_difference: root={root} out={out_root.resolve()} {cfg} "
+            f"save_diff={save_diff} min_pool2={min_pool2}",
+            file=sys.stderr,
+            flush=True,
+        )
     out_base: Path | None = None
+    bg_out_base: Path | None = None
     if save_diff:
         out_base = (out_root / "background_difference").resolve()
         out_base.mkdir(parents=True, exist_ok=True)
+        bg_out_base = (out_root / "background_difference_background").resolve()
+        bg_out_base.mkdir(parents=True, exist_ok=True)
     bbox_base: Path | None = None
     if save_otsu_bboxes:
         bbox_base = (out_root / "background_difference_otsu_bboxes").resolve()
@@ -589,18 +894,34 @@ def run(
             out_root / "background_difference_watershed_side_by_side"
         ).resolve()
         ws_sbs_base.mkdir(parents=True, exist_ok=True)
+    ws_seeds_base: Path | None = None
+    if save_watershed_seeds:
+        ws_seeds_base = (
+            out_root / "background_difference_watershed_seeds"
+        ).resolve()
+        ws_seeds_base.mkdir(parents=True, exist_ok=True)
 
     date_dirs = sorted(
         p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")
     )
     for date_dir in date_dirs:
+        if verbose:
+            print(f"\n[{date_dir.relative_to(root)}]", file=sys.stderr, flush=True)
         if use_rolling:
             paths = _collect_images_under(date_dir)
             if not paths:
+                if verbose:
+                    print("  (no images, skip)", file=sys.stderr, flush=True)
                 continue
             by_parent = _group_images_by_parent(paths)
             for _parent, in_folder in by_parent.items():
                 ordered = sorted(in_folder, key=lambda p: p.name)
+                if verbose:
+                    print(
+                        f"  folder {_parent.relative_to(root)}: {len(ordered)} images",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 for i, img_path in enumerate(ordered):
                     n_paths = _rolling_neighbor_paths(ordered, i, rolling_half)
                     if not n_paths:
@@ -623,18 +944,33 @@ def run(
                             f"Image shape {img.shape} does not match background "
                             f"{background.shape} for {img_path}"
                         )
-                    diff = _diff_nonnegative(img, background)
+                    img_full = img
+                    orig_hw: Optional[Tuple[int, int]] = None
+                    if min_pool2:
+                        img, background_work, orig_hw = _min_pool2_pair(
+                            img, background
+                        )
+                    else:
+                        background_work = background
+                    diff = _diff_nonnegative(img, background_work)
+                    if verbose:
+                        print(
+                            f"    processing {img_path.relative_to(root)} …",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                     _process_one_image(
                         root,
                         img,
                         img_path,
+                        background_work,
                         diff,
                         out_base,
+                        bg_out_base,
                         bbox_base,
                         bbox_sbs_base,
                         save_otsu_bboxes,
                         save_otsu_bboxes_side_by_side,
-                        bbox_fixed_threshold,
                         save_watershed,
                         save_watershed_side_by_side,
                         watershed_t,
@@ -644,11 +980,32 @@ def run(
                         watershed_min_area,
                         ws_base,
                         ws_sbs_base,
+                        save_watershed_seeds,
+                        ws_seeds_base,
+                        verbose=verbose,
+                        orig_hw_pool_restore=orig_hw,
+                        img_fullres=img_full if min_pool2 else None,
                     )
+                    processed += 1
+                    if verbose:
+                        print(
+                            f"    done {img_path.relative_to(root)}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
         else:
             background = _build_background_in_ram(date_dir, method, n)
             if background is None:
+                if verbose:
+                    print("  (no images, skip)", file=sys.stderr, flush=True)
                 continue
+            if verbose:
+                h, w = background.shape[:2]
+                print(
+                    f"  background {w}x{h} ({method}, sampled from date tree)",
+                    file=sys.stderr,
+                    flush=True,
+                )
             for img_path in _collect_images_under(date_dir):
                 img = _read_bgr(img_path)
                 if img.shape != background.shape:
@@ -656,18 +1013,31 @@ def run(
                         f"Image shape {img.shape} does not match background "
                         f"{background.shape} for {img_path}"
                     )
-                diff = _diff_nonnegative(img, background)
+                img_full = img
+                orig_hw: Optional[Tuple[int, int]] = None
+                if min_pool2:
+                    img, background_work, orig_hw = _min_pool2_pair(img, background)
+                else:
+                    background_work = background
+                diff = _diff_nonnegative(img, background_work)
+                if verbose:
+                    print(
+                        f"  processing {img_path.relative_to(root)} …",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 _process_one_image(
                     root,
                     img,
                     img_path,
+                    background_work,
                     diff,
                     out_base,
+                    bg_out_base,
                     bbox_base,
                     bbox_sbs_base,
                     save_otsu_bboxes,
                     save_otsu_bboxes_side_by_side,
-                    bbox_fixed_threshold,
                     save_watershed,
                     save_watershed_side_by_side,
                     watershed_t,
@@ -677,7 +1047,25 @@ def run(
                     watershed_min_area,
                     ws_base,
                     ws_sbs_base,
+                    save_watershed_seeds,
+                    ws_seeds_base,
+                    verbose=verbose,
+                    orig_hw_pool_restore=orig_hw,
+                    img_fullres=img_full if min_pool2 else None,
                 )
+                processed += 1
+                if verbose:
+                    print(
+                        f"  done {img_path.relative_to(root)}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+    if verbose:
+        print(
+            f"\nbackground_difference: done, processed {processed} image(s)",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def main() -> None:
@@ -685,10 +1073,13 @@ def main() -> None:
         description=(
             "Per date: background in RAM from N random images; save max(0, difference) for each "
             "image. Each run creates a new <output>/run0, run1, … folder and writes "
-            "<output>/runN/background_difference/ (unless --no-diff). With --bboxes, Otsu boxes under "
-            "<output>/runN/background_difference_otsu_bboxes/; optional half-size …_bboxes_side_by_side/; "
+            "<output>/runN/background_difference/ (unless --no-diff) and matching backgrounds under "
+            "<output>/runN/background_difference_background/. With --bboxes, watershed instance boxes under "
+            "<output>/runN/background_difference_otsu_bboxes/ (after full watershed, margin per side); "
+            "optional half-size …_bboxes_side_by_side/; "
             "uint16 label .npz with --watershed under …/background_difference_watershed/; "
-            "and half-size …/background_difference_watershed_side_by_side/ with --watershed-side-by-side. "
+            "and half-size …/background_difference_watershed_side_by_side/ with --watershed-side-by-side; "
+            "initial marker seeds (green fg, red bg) with --watershed-seeds under …/background_difference_watershed_seeds/. "
             "A run_metadata.txt in each runN records parameters."
         )
     )
@@ -735,6 +1126,26 @@ def main() -> None:
         help="Base output directory: each run creates a new <output>/run0, run1, … and saves under it (default: ./outputs)",
     )
     parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help=(
+            "Print progress to stderr: run configuration, each file, and per-step timings inside "
+            "watershed (cv2.watershed, merge CC8, remove small instances, overlay, .npz, side-by-side)."
+        ),
+    )
+    parser.add_argument(
+        "--min-pool2",
+        action="store_true",
+        help=(
+            "After optional even-HW pad (edge replicate), replace each 2×2 block in the frame and "
+            "in the background with the minimum BGR (or gray) over those 4 pixels; run diff / "
+            "watershed / etc. on the half-size tensors; for every saved image and label map, upscale "
+            "by duplicating each pixel into a 2×2 block (no interpolation) and crop to the original "
+            "resolution. Watershed side-by-side uses the full-resolution input on the left."
+        ),
+    )
+    parser.add_argument(
         "--no-diff",
         action="store_true",
         help="Do not write <output>/runN/background_difference/ (diff). Use another output flag (bboxes, watershed, …).",
@@ -743,9 +1154,10 @@ def main() -> None:
         "--bboxes",
         action="store_true",
         help=(
-            "Binarize diff (Otsu, or use --bbox-threshold for fixed) + 8-connected components; "
-            "draw each bbox on the original (skip area < 100; 100–999 yellow, 1000+ green); save to "
-            "<output>/background_difference_otsu_bboxes/ (same relpath as inputs)"
+            "Run the full watershed pipeline, then draw one axis-aligned box per instance (label >= 2) "
+            "on the original (skip area < 100; 100–999 yellow, 1000+ green); "
+            f"each box expanded by {BBOX_OUTWARD_MARGIN_PX} px per side (clipped). "
+            "Saves to <output>/runN/background_difference_otsu_bboxes/ (same relpath as inputs)."
         ),
     )
     parser.add_argument(
@@ -766,8 +1178,8 @@ def main() -> None:
         metavar="T",
         dest="bbox_fixed_threshold",
         help=(
-            "Bbox mask: if omitted, Otsu on the diff. If set, fixed THRESH_BINARY on the diff gray "
-            "(0–255). With no value, 16. Example: --bbox-threshold 32"
+            "Ignored (kept for compatibility). Bboxes use watershed instance labels; see --watershed-t "
+            "and --watershed-min-area."
         ),
     )
     parser.add_argument(
@@ -805,6 +1217,16 @@ def main() -> None:
             "Save original (left) | watershed overlay (right) at half width and height to "
             "<output>/runN/background_difference_watershed_side_by_side/ (no need for --watershed; "
             "reuses the same T and min-area as --watershed-t / --watershed-min-area)"
+        ),
+    )
+    parser.add_argument(
+        "--watershed-seeds",
+        action="store_true",
+        dest="watershed_seeds",
+        help=(
+            "Save BGR images of cv2.watershed **initial** markers to "
+            "<output>/runN/background_difference_watershed_seeds/: green = foreground seed pixels, "
+            "red = background seed pixels, unchanged color = unknown (uses --watershed-t; does not require --watershed)."
         ),
     )
     parser.add_argument(
@@ -874,10 +1296,11 @@ def main() -> None:
     save_otsu_bboxes_sbs = bool(args.bboxes_side_by_side)
     save_watershed = bool(args.watershed)
     save_watershed_sbs = bool(args.watershed_side_by_side)
-    if not save_diff and not save_otsu_bboxes and not save_otsu_bboxes_sbs and not save_watershed and not save_watershed_sbs:
+    save_watershed_seeds = bool(args.watershed_seeds)
+    if not save_diff and not save_otsu_bboxes and not save_otsu_bboxes_sbs and not save_watershed and not save_watershed_sbs and not save_watershed_seeds:
         print(
             "--no-diff with nothing to save: add --bboxes, --bboxes-side-by-side, --watershed, "
-            "and/or --watershed-side-by-side, or remove --no-diff",
+            "--watershed-side-by-side, --watershed-seeds, or remove --no-diff",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -903,8 +1326,10 @@ def main() -> None:
                 "bbox_fixed_threshold",
                 str(bft) if bft is not None else "None (Otsu if bboxes)",
             ),
+            ("bbox_outward_margin_px", str(BBOX_OUTWARD_MARGIN_PX)),
             ("watershed", str(args.watershed)),
             ("watershed_side_by_side", str(args.watershed_side_by_side)),
+            ("watershed_seeds", str(bool(args.watershed_seeds))),
             ("watershed_t", str(wt)),
             ("watershed_min_area", str(wma)),
             (
@@ -913,6 +1338,8 @@ def main() -> None:
             ),
             ("circular_morph_dilate_iter", str(cdi)),
             ("circular_morph_erode_iter", str(cei)),
+            ("verbose", str(bool(args.verbose))),
+            ("min_pool2", str(bool(args.min_pool2))),
         ],
     )
     run(
@@ -925,14 +1352,16 @@ def main() -> None:
         save_diff=save_diff,
         save_otsu_bboxes=save_otsu_bboxes,
         save_otsu_bboxes_side_by_side=save_otsu_bboxes_sbs,
-        bbox_fixed_threshold=bft,
         save_watershed=save_watershed,
         save_watershed_side_by_side=save_watershed_sbs,
+        save_watershed_seeds=save_watershed_seeds,
         watershed_t=wt,
         circular_morph_radius=cmr,
         circular_morph_dilate_iter=cdi,
         circular_morph_erode_iter=cei,
         watershed_min_area=wma,
+        verbose=bool(args.verbose),
+        min_pool2=bool(args.min_pool2),
     )
 
 
