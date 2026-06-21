@@ -49,6 +49,17 @@ IMAGE_EXTENSIONS = {
 }
 Method = Literal["mean", "median"]
 
+# Depth tag in image filenames: ``..._<sign><7-digit-depth>.<ext>`` (e.g. ``..._+0000512.jpg``).
+DEPTH_RE = re.compile(r"_([+-]\d{7})\.[^.]+$")
+
+
+def _parse_depth_from_name(name: str) -> Optional[int]:
+    """Signed depth parsed from an image filename, or ``None`` if the tag is absent."""
+    m = DEPTH_RE.search(name)
+    if not m:
+        return None
+    return int(m.group(1))
+
 
 def _vlog(verbose: bool, msg: str, indent: str = "      ") -> None:
     if verbose:
@@ -851,6 +862,7 @@ def run(
     watershed_min_area: int = 100,
     verbose: bool = False,
     min_pool2: bool = False,
+    min_depth: Optional[int] = 500,
 ) -> None:
     root = root.resolve()
     if not root.is_dir():
@@ -863,7 +875,8 @@ def run(
             cfg = f"method={method} n_images={n}"
         print(
             f"background_difference: root={root} out={out_root.resolve()} {cfg} "
-            f"save_diff={save_diff} min_pool2={min_pool2}",
+            f"save_diff={save_diff} min_pool2={min_pool2} "
+            f"min_depth={'off' if min_depth is None else min_depth}",
             file=sys.stderr,
             flush=True,
         )
@@ -923,6 +936,15 @@ def run(
                         flush=True,
                     )
                 for i, img_path in enumerate(ordered):
+                    if min_depth is not None:
+                        depth = _parse_depth_from_name(img_path.name)
+                        if depth is not None and depth <= min_depth:
+                            if verbose:
+                                _vlog(
+                                    verbose,
+                                    f"  skip (depth {depth} <= {min_depth}): {img_path.name}",
+                                )
+                            continue
                     n_paths = _rolling_neighbor_paths(ordered, i, rolling_half)
                     if not n_paths:
                         print(
@@ -1007,6 +1029,15 @@ def run(
                     flush=True,
                 )
             for img_path in _collect_images_under(date_dir):
+                if min_depth is not None:
+                    depth = _parse_depth_from_name(img_path.name)
+                    if depth is not None and depth <= min_depth:
+                        if verbose:
+                            _vlog(
+                                verbose,
+                                f"  skip (depth {depth} <= {min_depth}): {img_path.name}",
+                            )
+                        continue
                 img = _read_bgr(img_path)
                 if img.shape != background.shape:
                     raise ValueError(
@@ -1144,6 +1175,23 @@ def main() -> None:
             "by duplicating each pixel into a 2×2 block (no interpolation) and crop to the original "
             "resolution. Watershed side-by-side uses the full-resolution input on the left."
         ),
+    )
+    parser.add_argument(
+        "--min-depth",
+        type=int,
+        default=500,
+        metavar="D",
+        help=(
+            "Only process images whose depth tag is strictly greater than D (default 500). "
+            "Depth is parsed from the filename suffix '_<sign><7 digits>.<ext>' (e.g. '..._+0000512.jpg'). "
+            "Images without a depth tag are always processed. Pass -1 (or any value below the minimum "
+            "possible depth) to disable depth filtering."
+        ),
+    )
+    parser.add_argument(
+        "--no-depth-filter",
+        action="store_true",
+        help="Disable depth filtering entirely (overrides --min-depth).",
     )
     parser.add_argument(
         "--no-diff",
@@ -1291,6 +1339,7 @@ def main() -> None:
     if wma < 0:
         print("--watershed-min-area must be >= 0", file=sys.stderr)
         sys.exit(1)
+    min_depth = None if args.no_depth_filter else int(args.min_depth)
     save_diff = not args.no_diff
     save_otsu_bboxes = bool(args.bboxes)
     save_otsu_bboxes_sbs = bool(args.bboxes_side_by_side)
@@ -1340,6 +1389,7 @@ def main() -> None:
             ("circular_morph_erode_iter", str(cei)),
             ("verbose", str(bool(args.verbose))),
             ("min_pool2", str(bool(args.min_pool2))),
+            ("min_depth", "off" if min_depth is None else str(min_depth)),
         ],
     )
     run(
@@ -1362,6 +1412,7 @@ def main() -> None:
         watershed_min_area=wma,
         verbose=bool(args.verbose),
         min_pool2=bool(args.min_pool2),
+        min_depth=min_depth,
     )
 
 
