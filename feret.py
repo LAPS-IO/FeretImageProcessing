@@ -32,7 +32,10 @@ import csv
 import random
 import re
 import sys
+import zipfile
+import zlib
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -183,16 +186,34 @@ def iter_watershed_npz(run_dir: Path) -> list[Path]:
     return out
 
 
+def load_labels_or_none(path: Path) -> Optional[np.ndarray]:
+    """Load the ``labels`` array from an npz, or ``None`` if the archive is corrupt.
+
+    Corruption (e.g. ``Bad CRC-32`` from a truncated/damaged ``.npy`` member inside the
+    zip) is raised lazily by ``zipfile`` while decompressing, so the actual array access
+    is guarded too, not just ``np.load``.
+    """
+    try:
+        data = np.load(path)
+        if "labels" not in data.files:
+            print(f"{path}: skip, npz has no array 'labels'", file=sys.stderr)
+            return None
+        return np.asarray(data["labels"])
+    except (zipfile.BadZipFile, zlib.error, EOFError) as e:
+        print(f"{path}: skip, corrupt npz ({e})", file=sys.stderr)
+        return None
+
+
 def process_npz(
     path: Path, writer: csv.writer, edge_strip_px: int, um_per_pixel: float
 ) -> None:
     leaf = path.name
     dt_s, depth = parse_filename(leaf)
 
-    data = np.load(path)
-    if "labels" not in data.files:
-        raise KeyError(f"{path}: npz has no array 'labels', keys={data.files}")
-    lab = prepare_labels_for_feret(np.asarray(data["labels"]), edge_strip_px)
+    raw = load_labels_or_none(path)
+    if raw is None:
+        return
+    lab = prepare_labels_for_feret(raw, edge_strip_px)
     if lab.ndim != 2:
         raise ValueError(f"{path}: labels must be 2D, shape={lab.shape}")
 
@@ -473,11 +494,9 @@ def main() -> None:
 
         esp = int(args.edge_strip)
         for p in tqdm(picked, desc="Viz PNG", unit="img"):
-            data = np.load(p)
-            if "labels" not in data.files:
-                print(f"{p}: skip viz, no labels", file=sys.stderr)
+            lab = load_labels_or_none(p)
+            if lab is None:
                 continue
-            lab = np.asarray(data["labels"])
             if lab.ndim != 2:
                 continue
             if viz_orig is not None:
