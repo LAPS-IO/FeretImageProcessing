@@ -39,13 +39,13 @@ source .venv/bin/activate
 Ajuste `{caminho para a pasta de imagens}` e `{N}`:
 
 ```bash
-python run_extraction_all_folders.py {caminho para a pasta de imagens} outputs/run{N}/ -v
+python3 run_extraction_all_folders.py {caminho para a pasta de imagens} outputs/run{N}/ -v
 ```
 
 Por exemplo, para extrair os ROIs de **2/12/25**:
 
 ```bash
-python run_extraction_all_folders.py /home/laps/Documentos/Limpeza_Casco/Raw/04_Campanha_Dezembro_2025/02122025 outputs/run2/ -v
+python3 run_extraction_all_folders.py /home/laps/Documentos/Limpeza_Casco/Raw/04_Campanha_Dezembro_2025/02122025 outputs/run2/ -v
 ```
 
 ### 5. Resultado

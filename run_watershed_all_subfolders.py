@@ -4,33 +4,45 @@ For each direct child directory of a given path, run::
 
     python3 background_difference.py <subfolder> --rolling --watershed
         --watershed-t 4 --watershed-side-by-side --no-diff --circular-morph 11
+        [--min-depth D | --no-depth-filter]
 
 Usage::
 
-    python3 run_watershed_all_subfolders.py <parent_path>
+    python3 run_watershed_all_subfolders.py <parent_path> [--min-depth D | --no-depth-filter]
 """
 
 from __future__ import annotations
 
+import argparse
 import subprocess
 import sys
 from pathlib import Path
 
 
 def main() -> None:
-    if len(sys.argv) != 2:
-        print(
-            f"Usage: {sys.argv[0]} <parent_path>",
-            file=sys.stderr,
+    parser = argparse.ArgumentParser(
+        description=(
+            "Runs background_difference with --rolling --watershed (and other fixed flags) "
+            "on each subfolder of parent_path."
         )
-        print(
-            "  Runs background_difference with --rolling --watershed (and fixed flags) "
-            "on each subfolder of parent_path.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    )
+    parser.add_argument("parent_path", type=Path, help="Parent folder; each direct subfolder is processed")
+    depth_group = parser.add_mutually_exclusive_group()
+    depth_group.add_argument(
+        "--min-depth",
+        type=int,
+        default=None,
+        metavar="D",
+        help="Passed through to background_difference.py's --min-depth (its own default is 500 if omitted).",
+    )
+    depth_group.add_argument(
+        "--no-depth-filter",
+        action="store_true",
+        help="Passed through to background_difference.py's --no-depth-filter (disables depth filtering).",
+    )
+    args = parser.parse_args()
 
-    parent = Path(sys.argv[1]).resolve()
+    parent = args.parent_path.resolve()
     if not parent.is_dir():
         print(f"Not a directory: {parent}", file=sys.stderr)
         sys.exit(1)
@@ -55,6 +67,10 @@ def main() -> None:
         "--watershed-side-by-side",
         "--no-diff",
     ]
+    if args.no_depth_filter:
+        extra.append("--no-depth-filter")
+    elif args.min_depth is not None:
+        extra.extend(["--min-depth", str(args.min_depth)])
 
     for sub in subs:
         cmd = [sys.executable, str(script), str(sub), *extra]

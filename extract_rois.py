@@ -11,11 +11,10 @@ For every 8-connected **instance** component, a crop is taken around its boundin
 ``--border`` (default 10) pixel margin on each side, clamped to the image. Components whose bounding
 box is contained inside another component's bounding box are skipped (only the outer one is kept).
 
-Components that span (almost) the whole image are ignored (see ``--max-coverage``). All crops are
-saved directly in the output folder (no per-image subfolders); the source relative path is flattened
-into each filename to keep names unique::
+Components that span (almost) the whole image are ignored (see ``--max-coverage``). Crops preserve
+the source relative folder layout under the output directory::
 
-    <output>/<rel_flattened>_x<left>_y<top>.png
+    <output>/<rel_parent>/<image_stem>_x<left>_y<top>.png
 
 By default the output folder is the run directory: if the npz folder is inside a run's
 ``background_difference_watershed``, crops go to ``<run_dir>/roi_crops`` (override with ``-o``).
@@ -230,7 +229,9 @@ def process_one(
         )
 
     rel = npz_path.relative_to(npz_root)
-    prefix = rel.with_suffix("").as_posix().replace("/", "__")
+    stem_path = rel.with_suffix("")
+    crop_dir = out_root / stem_path.parent
+    crop_dir.mkdir(parents=True, exist_ok=True)
     written = 0
     for idx in kept:
         _lid, bbox, _area = comps[idx]
@@ -238,8 +239,7 @@ def process_one(
         if crop.size == 0:
             continue
         top, left, _bottom, _right = bbox
-        name = f"{prefix}_x{left}_y{top}.png"
-        dest = out_root / name
+        dest = crop_dir / f"{stem_path.name}_x{left}_y{top}.png"
         if not cv2.imwrite(str(dest), crop):
             raise RuntimeError(f"Failed to write: {dest}")
         written += 1

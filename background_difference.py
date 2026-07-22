@@ -868,6 +868,7 @@ def run(
     if not root.is_dir():
         raise FileNotFoundError(f"Root is not a directory: {root}")
     processed = 0
+    failed: List[Path] = []
     if verbose:
         if use_rolling:
             cfg = f"rolling half-width={rolling_half}"
@@ -981,33 +982,42 @@ def run(
                             file=sys.stderr,
                             flush=True,
                         )
-                    _process_one_image(
-                        root,
-                        img,
-                        img_path,
-                        background_work,
-                        diff,
-                        out_base,
-                        bg_out_base,
-                        bbox_base,
-                        bbox_sbs_base,
-                        save_otsu_bboxes,
-                        save_otsu_bboxes_side_by_side,
-                        save_watershed,
-                        save_watershed_side_by_side,
-                        watershed_t,
-                        circular_morph_radius,
-                        circular_morph_dilate_iter,
-                        circular_morph_erode_iter,
-                        watershed_min_area,
-                        ws_base,
-                        ws_sbs_base,
-                        save_watershed_seeds,
-                        ws_seeds_base,
-                        verbose=verbose,
-                        orig_hw_pool_restore=orig_hw,
-                        img_fullres=img_full if min_pool2 else None,
-                    )
+                    try:
+                        _process_one_image(
+                            root,
+                            img,
+                            img_path,
+                            background_work,
+                            diff,
+                            out_base,
+                            bg_out_base,
+                            bbox_base,
+                            bbox_sbs_base,
+                            save_otsu_bboxes,
+                            save_otsu_bboxes_side_by_side,
+                            save_watershed,
+                            save_watershed_side_by_side,
+                            watershed_t,
+                            circular_morph_radius,
+                            circular_morph_dilate_iter,
+                            circular_morph_erode_iter,
+                            watershed_min_area,
+                            ws_base,
+                            ws_sbs_base,
+                            save_watershed_seeds,
+                            ws_seeds_base,
+                            verbose=verbose,
+                            orig_hw_pool_restore=orig_hw,
+                            img_fullres=img_full if min_pool2 else None,
+                        )
+                    except Exception as e:
+                        failed.append(img_path)
+                        print(
+                            f"ERROR processing image {img_path}: {e}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        continue
                     processed += 1
                     if verbose:
                         print(
@@ -1057,33 +1067,42 @@ def run(
                         file=sys.stderr,
                         flush=True,
                     )
-                _process_one_image(
-                    root,
-                    img,
-                    img_path,
-                    background_work,
-                    diff,
-                    out_base,
-                    bg_out_base,
-                    bbox_base,
-                    bbox_sbs_base,
-                    save_otsu_bboxes,
-                    save_otsu_bboxes_side_by_side,
-                    save_watershed,
-                    save_watershed_side_by_side,
-                    watershed_t,
-                    circular_morph_radius,
-                    circular_morph_dilate_iter,
-                    circular_morph_erode_iter,
-                    watershed_min_area,
-                    ws_base,
-                    ws_sbs_base,
-                    save_watershed_seeds,
-                    ws_seeds_base,
-                    verbose=verbose,
-                    orig_hw_pool_restore=orig_hw,
-                    img_fullres=img_full if min_pool2 else None,
-                )
+                try:
+                    _process_one_image(
+                        root,
+                        img,
+                        img_path,
+                        background_work,
+                        diff,
+                        out_base,
+                        bg_out_base,
+                        bbox_base,
+                        bbox_sbs_base,
+                        save_otsu_bboxes,
+                        save_otsu_bboxes_side_by_side,
+                        save_watershed,
+                        save_watershed_side_by_side,
+                        watershed_t,
+                        circular_morph_radius,
+                        circular_morph_dilate_iter,
+                        circular_morph_erode_iter,
+                        watershed_min_area,
+                        ws_base,
+                        ws_sbs_base,
+                        save_watershed_seeds,
+                        ws_seeds_base,
+                        verbose=verbose,
+                        orig_hw_pool_restore=orig_hw,
+                        img_fullres=img_full if min_pool2 else None,
+                    )
+                except Exception as e:
+                    failed.append(img_path)
+                    print(
+                        f"ERROR processing image {img_path}: {e}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
                 processed += 1
                 if verbose:
                     print(
@@ -1097,6 +1116,14 @@ def run(
             file=sys.stderr,
             flush=True,
         )
+    if failed:
+        print(
+            f"\nbackground_difference: {len(failed)} image(s) failed and were skipped:",
+            file=sys.stderr,
+            flush=True,
+        )
+        for path in failed:
+            print(f"  {path}", file=sys.stderr, flush=True)
 
 
 def main() -> None:
