@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
-"""PyQt5 front-end for :mod:`run_full_pipeline`.
+"""PyQt5 front-end for :mod:`segment_and_extract_rois`.
 
-Pick the parent folder that holds the image subfolders, tune the parameters for
-each stage (segmentation, Feret, ROI extraction), and run the whole pipeline
-while watching the live log. The actual work is delegated to
-``run_full_pipeline.py`` through a :class:`QProcess` so the UI stays responsive
-and the run can be stopped at any time.
+Pick a **campaign** folder whose layout is ``campaign/date/frames/images``, tune
+the parameters for each stage, and run the pipeline for every date. Outputs go
+to ``<output_base>/<campaign>/<date>/``. By default, if that folder already
+exists, only images that are not yet present in the output are processed.
 
     python3 pipeline_gui.py
 """
 
 from __future__ import annotations
 
-import re
 import sys
 from pathlib import Path
 
@@ -40,16 +38,46 @@ from PyQt5.QtWidgets import (
 REPO = Path(__file__).resolve().parent
 PIPELINE_SCRIPT = REPO / "segment_and_extract_rois.py"
 FERET_CSV_NAME = "feret_diameters.csv"
-RUN_RE = re.compile(r"^run(\d+)$")
+IMAGE_EXTENSIONS = {
+    ".bmp",
+    ".jpg",
+    ".jpeg",
+    ".jpe",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".webp",
+    ".pnm",
+    ".pgm",
+    ".ppm",
+}
+
+
+def list_date_folders(campaign: Path) -> list[Path]:
+    """Return date subfolders of a campaign that contain at least one image."""
+    dates: list[Path] = []
+    for date_dir in sorted(
+        p for p in campaign.iterdir() if p.is_dir() and not p.name.startswith(".")
+    ):
+        has_image = any(
+            path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+            for path in date_dir.rglob("*")
+        )
+        if has_image:
+            dates.append(date_dir)
+    return dates
 
 
 class PipelineWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Feret Image Processing - Segment + ROI + Feret")
-        self.resize(820, 760)
+        self.resize(820, 780)
         self._process: QProcess | None = None
         self._run_dir: Path | None = None
+        self._date_queue: list[tuple[Path, Path]] = []
+        self._date_index = 0
+        self._campaign_name = ""
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -67,16 +95,16 @@ class PipelineWindow(QMainWindow):
         group = QGroupBox("Input / Output")
         form = QFormLayout(group)
 
-        self.images_edit = QLineEdit()
-        self.images_edit.setPlaceholderText(
-            "Parent folder containing image subfolders"
+        self.campaign_edit = QLineEdit()
+        self.campaign_edit.setPlaceholderText(
+            "Campaign folder (campaign/date/frames/images)"
         )
-        images_button = QPushButton("Browse…")
-        images_button.clicked.connect(self._pick_images_root)
-        images_row = QHBoxLayout()
-        images_row.addWidget(self.images_edit, stretch=1)
-        images_row.addWidget(images_button)
-        form.addRow("Images folder:", self._wrap(images_row))
+        campaign_button = QPushButton("Browse…")
+        campaign_button.clicked.connect(self._pick_campaign)
+        campaign_row = QHBoxLayout()
+        campaign_row.addWidget(self.campaign_edit, stretch=1)
+        campaign_row.addWidget(campaign_button)
+        form.addRow("Campaign folder:", self._wrap(campaign_row))
 
         self.output_edit = QLineEdit(str(REPO / "outputs"))
         output_button = QPushButton("Browse…")
@@ -85,6 +113,12 @@ class PipelineWindow(QMainWindow):
         output_row.addWidget(self.output_edit, stretch=1)
         output_row.addWidget(output_button)
         form.addRow("Output base:", self._wrap(output_row))
+
+        self.skip_existing_check = QCheckBox(
+            "Skip images already present in outputs/<campaign>/<date> (default)"
+        )
+        self.skip_existing_check.setChecked(True)
+        form.addRow("", self.skip_existing_check)
 
         self.verbose_check = QCheckBox("Verbose output")
         self.verbose_check.setChecked(True)
@@ -121,6 +155,7 @@ class PipelineWindow(QMainWindow):
         self.depth_spin.setValue(500)
         self.depth_spin.setEnabled(False)
         self.depth_check.toggled.connect(self.depth_spin.setEnabled)
+        self.depth_check.setChecked(True)
         depth_row = QHBoxLayout()
         depth_row.addWidget(self.depth_check)
         depth_row.addWidget(self.depth_spin, stretch=1)
@@ -129,11 +164,13 @@ class PipelineWindow(QMainWindow):
         self.save_npz_check = QCheckBox(
             "Save .npz label maps (background_difference_watershed/)"
         )
+        self.save_npz_check.setChecked(True)
         form.addRow("", self.save_npz_check)
 
         self.save_sbs_check = QCheckBox(
             "Save side-by-side preview (background_difference_watershed_side_by_side/)"
         )
+        self.save_sbs_check.setChecked(True)
         form.addRow("", self.save_sbs_check)
         return group
 
@@ -141,7 +178,7 @@ class PipelineWindow(QMainWindow):
         group = QGroupBox("Feret")
         form = QFormLayout(group)
 
-        self.feret_check = QCheckBox("Compute Feret diameters (CSV in crops folder)")
+        self.feret_check = QCheckBox("Compute Feret diameters (CSV in date folder)")
         self.feret_check.setChecked(True)
         form.addRow("", self.feret_check)
 
@@ -202,41 +239,28 @@ class PipelineWindow(QMainWindow):
         return container
 
     # -------------------------------------------------------------- actions
-    def _pick_images_root(self) -> None:
-        start = self.images_edit.text().strip() or str(REPO)
+    def _pick_campaign(self) -> None:
+        start = self.campaign_edit.text().strip() or str(REPO)
         chosen = QFileDialog.getExistingDirectory(
-            self, "Select images parent folder", start
+            self, "Select campaign folder", start
         )
         if chosen:
-            self.images_edit.setText(chosen)
+            self.campaign_edit.setText(chosen)
 
     def _pick_output_base(self) -> None:
         start = self.output_edit.text().strip() or str(REPO)
         chosen = QFileDialog.getExistingDirectory(
-            self, "Select crops output folder", start
+            self, "Select output base folder", start
         )
         if chosen:
             self.output_edit.setText(chosen)
 
-    def _allocate_run_dir(self, base: Path) -> Path:
-        """Create and return ``base/run{N}`` with N = highest existing run number + 1."""
-        base.mkdir(parents=True, exist_ok=True)
-        last = -1
-        for child in base.iterdir():
-            if child.is_dir():
-                match = RUN_RE.match(child.name)
-                if match is not None:
-                    last = max(last, int(match.group(1)))
-        run_dir = base / f"run{last + 1}"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        return run_dir
-
-    def _build_arguments(self) -> list[str]:
-        images_root = self.images_edit.text().strip()
-        assert self._run_dir is not None
-        crops_dir = self._run_dir / "roi_crops"
-        args = [str(PIPELINE_SCRIPT), images_root]
-        args += ["--output", str(crops_dir), "--run-dir", str(self._run_dir)]
+    def _build_arguments(
+        self, date_dir: Path, run_dir: Path, *, output_existed: bool
+    ) -> list[str]:
+        crops_dir = run_dir / "roi_crops"
+        args = [str(PIPELINE_SCRIPT), str(date_dir)]
+        args += ["--output", str(crops_dir), "--run-dir", str(run_dir)]
         args += [
             "--rolling",
             "--rolling-width",
@@ -253,11 +277,15 @@ class PipelineWindow(QMainWindow):
         else:
             args.append("--no-depth-filter")
         if self.save_npz_check.isChecked():
-            npz_dir = self._run_dir / "background_difference_watershed"
-            args += ["--npz-dir", str(npz_dir)]
+            args += ["--npz-dir", str(run_dir / "background_difference_watershed")]
         if self.save_sbs_check.isChecked():
-            sbs_dir = self._run_dir / "background_difference_watershed_side_by_side"
-            args += ["--sbs-dir", str(sbs_dir)]
+            args += [
+                "--sbs-dir",
+                str(run_dir / "background_difference_watershed_side_by_side"),
+            ]
+        # Only skip when the date output folder already existed before this run.
+        if self.skip_existing_check.isChecked() and output_existed:
+            args.append("--skip-existing")
         args += [
             "--border",
             str(self.roi_border_spin.value()),
@@ -265,10 +293,9 @@ class PipelineWindow(QMainWindow):
             f"{self.roi_max_coverage_spin.value():g}",
         ]
         if self.feret_check.isChecked():
-            feret_csv = self._run_dir / FERET_CSV_NAME
             args += [
                 "--feret-csv",
-                str(feret_csv),
+                str(run_dir / FERET_CSV_NAME),
                 "--um-per-pixel",
                 f"{self.um_per_pixel_spin.value():g}",
                 "--edge-strip",
@@ -281,15 +308,16 @@ class PipelineWindow(QMainWindow):
     def _start_pipeline(self) -> None:
         if self._process is not None:
             return
-        images_root = self.images_edit.text().strip()
-        if not images_root:
+        campaign_text = self.campaign_edit.text().strip()
+        if not campaign_text:
             QMessageBox.warning(
-                self, "Missing folder", "Please choose an images parent folder."
+                self, "Missing folder", "Please choose a campaign folder."
             )
             return
-        if not Path(images_root).is_dir():
+        campaign = Path(campaign_text)
+        if not campaign.is_dir():
             QMessageBox.warning(
-                self, "Invalid folder", f"Not a directory:\n{images_root}"
+                self, "Invalid folder", f"Not a directory:\n{campaign}"
             )
             return
         if not PIPELINE_SCRIPT.is_file():
@@ -298,19 +326,68 @@ class PipelineWindow(QMainWindow):
             )
             return
 
-        base_text = self.output_edit.text().strip()
-        base = Path(base_text) if base_text else (REPO / "outputs")
-        try:
-            self._run_dir = self._allocate_run_dir(base)
-        except OSError as e:
-            QMessageBox.critical(
-                self, "Output error", f"Could not create run folder in:\n{base}\n\n{e}"
+        dates = list_date_folders(campaign)
+        if not dates:
+            QMessageBox.warning(
+                self,
+                "No dates found",
+                f"No date subfolders with images under:\n{campaign}",
             )
             return
 
-        args = self._build_arguments()
+        base_text = self.output_edit.text().strip()
+        base = Path(base_text) if base_text else (REPO / "outputs")
+        campaign_out = base / campaign.name
+        try:
+            campaign_out.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            QMessageBox.critical(
+                self,
+                "Output error",
+                f"Could not create campaign output folder:\n{campaign_out}\n\n{e}",
+            )
+            return
+
+        self._campaign_name = campaign.name
+        self._date_queue = [(date_dir, campaign_out / date_dir.name) for date_dir in dates]
+        self._date_index = 0
         self.log_view.clear()
-        self._append_log(f"Output folder: {self._run_dir}\n")
+        self._append_log(
+            f"Campaign: {campaign}\n"
+            f"Dates: {len(self._date_queue)} → {campaign_out}/\n"
+        )
+        self._set_running(True)
+        self._start_next_date()
+
+    def _start_next_date(self) -> None:
+        if self._date_index >= len(self._date_queue):
+            self.status_label.setText(
+                f"Finished successfully → {self._campaign_name}"
+            )
+            self._append_log("\n[campaign finished]\n")
+            self._process = None
+            self._run_dir = None
+            self._set_running(False)
+            return
+
+        date_dir, run_dir = self._date_queue[self._date_index]
+        self._run_dir = run_dir
+        output_existed = run_dir.is_dir()
+        try:
+            run_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self._append_log(f"\nERROR creating {run_dir}: {e}\n")
+            self.status_label.setText(f"Failed → {run_dir.name}")
+            self._process = None
+            self._set_running(False)
+            return
+
+        args = self._build_arguments(date_dir, run_dir, output_existed=output_existed)
+        label = f"{self._campaign_name}/{date_dir.name}"
+        progress = f"{self._date_index + 1}/{len(self._date_queue)}"
+        self._append_log(f"\n=== {label} ({progress}) → {run_dir} ===\n")
+        if "--skip-existing" in args:
+            self._append_log("(skip-existing enabled)\n")
         self._append_log(f"$ {sys.executable} {' '.join(args)}\n")
 
         process = QProcess(self)
@@ -322,15 +399,15 @@ class PipelineWindow(QMainWindow):
         process.finished.connect(self._on_finished)
         process.errorOccurred.connect(self._on_error)
         self._process = process
-
-        self._set_running(True)
-        self.status_label.setText(f"Running… → {self._run_dir.name}")
+        self.status_label.setText(f"Running… → {label} ({progress})")
         process.start()
 
     def _stop_pipeline(self) -> None:
         if self._process is None:
             return
         self.status_label.setText("Stopping…")
+        # Drop remaining dates so finish handler does not continue.
+        self._date_queue = self._date_queue[: self._date_index + 1]
         self._process.kill()
 
     # --------------------------------------------------------------- signals
@@ -351,14 +428,20 @@ class PipelineWindow(QMainWindow):
         self._append_log(data)
 
     def _on_finished(self, exit_code: int, _status: object) -> None:
-        run_name = self._run_dir.name if self._run_dir is not None else ""
-        if exit_code == 0:
-            self.status_label.setText(f"Finished successfully → {run_name}")
-        else:
-            self.status_label.setText(f"Failed (exit code {exit_code}) → {run_name}")
-        self._append_log(f"\n[process finished with exit code {exit_code}]\n")
+        date_name = self._run_dir.name if self._run_dir is not None else ""
+        self._append_log(
+            f"\n[date finished: {date_name}, exit code {exit_code}]\n"
+        )
         self._process = None
-        self._set_running(False)
+        if exit_code != 0:
+            self.status_label.setText(
+                f"Failed (exit code {exit_code}) → "
+                f"{self._campaign_name}/{date_name}"
+            )
+            self._set_running(False)
+            return
+        self._date_index += 1
+        self._start_next_date()
 
     def _on_error(self, _error: object) -> None:
         if self._process is None:
@@ -380,6 +463,7 @@ class PipelineWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt override)
         if self._process is not None:
+            self._date_queue = []
             self._process.kill()
             self._process.waitForFinished(3000)
         super().closeEvent(event)

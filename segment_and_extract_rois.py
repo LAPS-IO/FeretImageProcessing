@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime
+import re
 import shlex
 import sys
 import time
@@ -69,6 +70,8 @@ FERET_CSV_HEADER = [
     "diameter_um",
 ]
 
+CROP_EXIST_RE = re.compile(r"_x\d+_y\d+\.(?:png|jpg|jpeg|tif|tiff)$", re.IGNORECASE)
+
 
 def resolve_run_dir(out_root: Path, run_dir: Optional[Path]) -> Path:
     """Directory that receives ``run_metadata.txt`` (and usually holds roi_crops/)."""
@@ -77,6 +80,44 @@ def resolve_run_dir(out_root: Path, run_dir: Optional[Path]) -> Path:
     if out_root.name == "roi_crops":
         return out_root.parent.resolve()
     return out_root.resolve()
+
+
+def image_already_processed(
+    img_path: Path,
+    root: Path,
+    out_root: Path,
+    npz_root: Optional[Path],
+    sbs_root: Optional[Path],
+) -> bool:
+    """True only if every output this run would write for ``img_path`` already exists.
+
+    Partial runs (e.g. side-by-side present but ``roi_crops`` missing) are not skipped.
+    """
+    rel = img_path.relative_to(root)
+    stem_path = rel.with_suffix("")
+
+    def has_crops() -> bool:
+        crop_dir = out_root / stem_path.parent
+        if not crop_dir.is_dir():
+            return False
+        prefix = f"{stem_path.name}_x"
+        for path in crop_dir.iterdir():
+            if (
+                path.is_file()
+                and path.name.startswith(prefix)
+                and CROP_EXIST_RE.search(path.name) is not None
+            ):
+                return True
+        return False
+
+    # Crops are always written by this pipeline.
+    if not has_crops():
+        return False
+    if npz_root is not None and not (npz_root / rel).with_suffix(".npz").is_file():
+        return False
+    if sbs_root is not None and not (sbs_root / rel).is_file():
+        return False
+    return True
 
 
 def write_run_metadata(
@@ -311,6 +352,7 @@ def run(args: argparse.Namespace) -> None:
             ("max_coverage", str(float(args.max_coverage))),
             ("edge_strip", str(int(args.edge_strip))),
             ("um_per_pixel", str(float(args.um_per_pixel))),
+            ("skip_existing", str(bool(args.skip_existing))),
             ("verbose", str(verbose)),
         ],
     )
@@ -331,19 +373,35 @@ def run(args: argparse.Namespace) -> None:
             flush=True,
         )
 
-    stats = {"processed": 0, "crops": 0, "feret": 0}
+    stats = {"processed": 0, "crops": 0, "feret": 0, "skipped": 0}
     failed: list[Path] = []
+    skip_existing = bool(args.skip_existing)
+
+    def should_skip(img_path: Path) -> bool:
+        if not skip_existing:
+            return False
+        if image_already_processed(img_path, root, out_root, npz_root, sbs_root):
+            stats["skipped"] += 1
+            if verbose:
+                print(
+                    f"  skip existing: {img_path.relative_to(root)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return True
+        return False
 
     def traverse(feret_writer: "Optional[csv.writer]") -> None:
-        date_dirs = sorted(
+        # Children of root are frame folders (e.g. Config 01 / Basler_*_frames).
+        frame_dirs = sorted(
             p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")
         )
-        for date_dir in date_dirs:
+        for frame_dir in frame_dirs:
             if verbose:
-                print(f"\n[{date_dir.relative_to(root)}]", file=sys.stderr, flush=True)
+                print(f"\n[{frame_dir.relative_to(root)}]", file=sys.stderr, flush=True)
 
             if use_rolling:
-                paths = bd._collect_images_under(date_dir)
+                paths = bd._collect_images_under(frame_dir)
                 if not paths:
                     if verbose:
                         print("  (no images, skip)", file=sys.stderr, flush=True)
@@ -356,6 +414,8 @@ def run(args: argparse.Namespace) -> None:
                             depth = bd._parse_depth_from_name(img_path.name)
                             if depth is not None and depth <= min_depth:
                                 continue
+                        if should_skip(img_path):
+                            continue
                         neighbor_paths = bd._rolling_neighbor_paths(
                             ordered, i, rolling_half
                         )
@@ -383,17 +443,19 @@ def run(args: argparse.Namespace) -> None:
                         )
             else:
                 background = bd._build_background_in_ram(
-                    date_dir, args.method, int(args.n_images)
+                    frame_dir, args.method, int(args.n_images)
                 )
                 if background is None:
                     if verbose:
                         print("  (no images, skip)", file=sys.stderr, flush=True)
                     continue
-                for img_path in bd._collect_images_under(date_dir):
+                for img_path in bd._collect_images_under(frame_dir):
                     if min_depth is not None:
                         depth = bd._parse_depth_from_name(img_path.name)
                         if depth is not None and depth <= min_depth:
                             continue
+                    if should_skip(img_path):
+                        continue
                     _accumulate(
                         _process_path(
                             root,
@@ -422,15 +484,18 @@ def run(args: argparse.Namespace) -> None:
 
     if feret_csv is not None:
         feret_csv.parent.mkdir(parents=True, exist_ok=True)
-        with open(feret_csv, "w", newline="", encoding="utf-8") as f:
+        append = skip_existing and feret_csv.is_file() and feret_csv.stat().st_size > 0
+        with open(feret_csv, "a" if append else "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(FERET_CSV_HEADER)
+            if not append:
+                writer.writerow(FERET_CSV_HEADER)
             traverse(writer)
     else:
         traverse(None)
 
     summary = (
         f"\nsegment_and_extract: processed {stats['processed']} image(s), "
+        f"skipped {stats['skipped']} existing, "
         f"wrote {stats['crops']} crop(s) under {out_root}; "
         f"metadata -> {run_dir / 'run_metadata.txt'}"
     )
@@ -558,6 +623,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Directory for run_metadata.txt (default: parent of --output when that folder "
             "is named roi_crops, otherwise --output itself)."
+        ),
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help=(
+            "Skip images that already have all outputs this run would write (ROI crops, "
+            "and .npz / side-by-side when those dirs are set). Partial outputs are "
+            "reprocessed. When set with an existing feret CSV, new rows are appended."
         ),
     )
 
