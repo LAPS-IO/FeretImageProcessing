@@ -55,6 +55,8 @@ bash run_gui.sh
 
 ### Executar com duplo clique (Ubuntu)
 
+Alternativamente, para evitar usar o terminal, é possível configurar o arquivo `run_gui.sh` para rodar com duplo clique do mouse. 
+
 Para abrir a GUI clicando duas vezes em `run_gui.sh` no gerenciador de arquivos, é preciso
 marcar o arquivo como executável **uma vez**:
 
@@ -83,14 +85,16 @@ chmod +x run_gui.sh
 
 ### Uso da GUI
 
-1. **Campaign folder** — pasta da campanha, com layout `campanha/data/frames/imagens`
+1. **Pasta da campanha** — pasta da campanha, com layout `campanha/data/frames/imagens`
    (cada data contém subpastas de frames, por exemplo `Config 01` ou `Basler_*_frames`).
-2. **Output base** — normalmente `outputs/`; o pipeline grava em
+2. **Pasta base de saída** — normalmente `outputs/`; o pipeline grava em
    `outputs/<campanha>/<data>/` (`roi_crops`, Feret CSV, `.npz` e previews, conforme as opções).
-3. Ajuste os parâmetros de segmentação, Feret e ROI se necessário e clique em **Run pipeline**.
+3. Ajuste os parâmetros de segmentação, Feret e ROI se necessário e clique em **Executar pipeline**.
 
 Por padrão, se a pasta de saída de uma data já existir, só são processadas imagens que ainda
 não têm saída completa (ROI, `.npz` e side-by-side, quando habilitados).
+
+Para verificar o que faz cada parâmetro, cheque o arquivo `docs/parametros.html`.
 
 > **Nota:** o processamento de uma campanha inteira pode demorar bastante.
 
