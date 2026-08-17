@@ -53,6 +53,34 @@ Ou, sem precisar ativar manualmente (o script faz isso por você):
 bash run_gui.sh
 ```
 
+### Executar com duplo clique (Ubuntu)
+
+Para abrir a GUI clicando duas vezes em `run_gui.sh` no gerenciador de arquivos, é preciso
+marcar o arquivo como executável **uma vez**:
+
+1. Abra a pasta `FeretImageProcessing` no Gerenciador de arquivos (Nautilus).
+2. Clique com o **botão direito** em `run_gui.sh`.
+3. Escolha **Propriedades**.
+4. Vá à aba **Permissões**.
+5. Marque **Permitir executar arquivo como programa** (ou **Executar como programa**).
+6. Feche a janela de propriedades.
+
+Depois disso, um **duplo clique** em `run_gui.sh` deve executar o script (ele ativa o `.venv`
+e abre a GUI).
+
+Se o Ubuntu perguntar o que fazer com o arquivo, escolha **Executar** ou **Executar no
+Terminal** — a GUI precisa de terminal para mostrar o log do pipeline. Se abrir só o editor
+de texto, volte às Propriedades e confira se a opção de executar está marcada; em alguns
+sistemas também é preciso definir o comportamento padrão de arquivos `.sh` como “Executar”
+nas preferências do gerenciador de arquivos.
+
+Equivalente pelo terminal (mesma permissão):
+
+```bash
+chmod +x run_gui.sh
+./run_gui.sh
+```
+
 ### Uso da GUI
 
 1. **Campaign folder** — pasta da campanha, com layout `campanha/data/frames/imagens`
@@ -68,7 +96,14 @@ não têm saída completa (ROI, `.npz` e side-by-side, quando habilitados).
 
 ## Próximas execuções
 
-Depois da instalação inicial, basta abrir o terminal na pasta do projeto e rodar:
+Depois da instalação inicial, para rodar o programa, há 2 alternativas:
+
+### Executar com duplo clique 
+
+Ver seção "Executar com duplo clique (Ubuntu)" acima.
+
+### Rodar pelo terminal
+Abrir o terminal na pasta do projeto e rodar:
 
 ```bash
 bash run_gui.sh
