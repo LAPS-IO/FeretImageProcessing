@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""PyQt5 front-end for :mod:`segment_and_extract_rois`.
+"""Interface PyQt5 para :mod:`segment_and_extract_rois`.
 
-Pick a **campaign** folder whose layout is ``campaign/date/frames/images``, tune
-the parameters for each stage, and run the pipeline for every date. Outputs go
-to ``<output_base>/<campaign>/<date>/``. By default, if that folder already
-exists, only images that are not yet present in the output are processed.
+Escolha uma pasta de **campanha** com layout ``campanha/data/frames/imagens``,
+ajuste os parâmetros de cada etapa e execute o pipeline para todas as datas.
+As saídas vão para ``<base_saida>/<campanha>/<data>/``. Por padrão, se essa
+pasta já existir, apenas as imagens que ainda não estão na saída são processadas.
 
     python3 pipeline_gui.py
 """
@@ -54,7 +54,7 @@ IMAGE_EXTENSIONS = {
 
 
 def list_date_folders(campaign: Path) -> list[Path]:
-    """Return date subfolders of a campaign that contain at least one image."""
+    """Retorna subpastas de data de uma campanha que contêm ao menos uma imagem."""
     dates: list[Path] = []
     for date_dir in sorted(
         p for p in campaign.iterdir() if p.is_dir() and not p.name.startswith(".")
@@ -71,7 +71,7 @@ def list_date_folders(campaign: Path) -> list[Path]:
 class PipelineWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Feret Image Processing - Segment + ROI + Feret")
+        self.setWindowTitle("Processamento de Imagens Feret - Segmentação + ROI + Feret")
         self.resize(820, 780)
         self._process: QProcess | None = None
         self._run_dir: Path | None = None
@@ -92,64 +92,64 @@ class PipelineWindow(QMainWindow):
 
     # ------------------------------------------------------------------ UI
     def _build_io_group(self) -> QGroupBox:
-        group = QGroupBox("Input / Output")
+        group = QGroupBox("Entrada / Saída")
         form = QFormLayout(group)
 
         self.campaign_edit = QLineEdit()
         self.campaign_edit.setPlaceholderText(
-            "Campaign folder (campaign/date/frames/images)"
+            "Pasta da campanha (campanha/data/frames/imagens)"
         )
-        campaign_button = QPushButton("Browse…")
+        campaign_button = QPushButton("Procurar…")
         campaign_button.clicked.connect(self._pick_campaign)
         campaign_row = QHBoxLayout()
         campaign_row.addWidget(self.campaign_edit, stretch=1)
         campaign_row.addWidget(campaign_button)
-        form.addRow("Campaign folder:", self._wrap(campaign_row))
+        form.addRow("Pasta da campanha:", self._wrap(campaign_row))
 
         self.output_edit = QLineEdit(str(REPO / "outputs"))
-        output_button = QPushButton("Browse…")
+        output_button = QPushButton("Procurar…")
         output_button.clicked.connect(self._pick_output_base)
         output_row = QHBoxLayout()
         output_row.addWidget(self.output_edit, stretch=1)
         output_row.addWidget(output_button)
-        form.addRow("Output base:", self._wrap(output_row))
+        form.addRow("Pasta base de saída:", self._wrap(output_row))
 
         self.skip_existing_check = QCheckBox(
-            "Skip images already present in outputs/<campaign>/<date> (default)"
+            "Ignorar imagens já presentes em outputs/<campanha>/<data> (padrão)"
         )
         self.skip_existing_check.setChecked(True)
         form.addRow("", self.skip_existing_check)
 
-        self.verbose_check = QCheckBox("Verbose output")
+        self.verbose_check = QCheckBox("Saída detalhada (verbose)")
         self.verbose_check.setChecked(True)
         form.addRow("", self.verbose_check)
         return group
 
     def _build_segmentation_group(self) -> QGroupBox:
-        group = QGroupBox("Segmentation")
+        group = QGroupBox("Segmentação")
         form = QFormLayout(group)
 
         self.rolling_width_spin = QSpinBox()
         self.rolling_width_spin.setRange(1, 999)
         self.rolling_width_spin.setValue(5)
-        form.addRow("Rolling width:", self.rolling_width_spin)
+        form.addRow("Largura rolling:", self.rolling_width_spin)
 
         self.watershed_threshold_spin = QSpinBox()
         self.watershed_threshold_spin.setRange(0, 255)
         self.watershed_threshold_spin.setValue(4)
-        form.addRow("Watershed threshold:", self.watershed_threshold_spin)
+        form.addRow("Limiar watershed:", self.watershed_threshold_spin)
 
         self.watershed_min_area_spin = QSpinBox()
         self.watershed_min_area_spin.setRange(0, 10_000_000)
         self.watershed_min_area_spin.setValue(250)
-        form.addRow("Watershed min area (px):", self.watershed_min_area_spin)
+        form.addRow("Área mínima watershed (px):", self.watershed_min_area_spin)
 
         self.circular_morph_spin = QSpinBox()
         self.circular_morph_spin.setRange(1, 999)
         self.circular_morph_spin.setValue(11)
-        form.addRow("Circular morph radius:", self.circular_morph_spin)
+        form.addRow("Raio morfologia circular:", self.circular_morph_spin)
 
-        self.depth_check = QCheckBox("Filter by minimum depth")
+        self.depth_check = QCheckBox("Filtrar por profundidade mínima")
         self.depth_spin = QSpinBox()
         self.depth_spin.setRange(-10_000_000, 10_000_000)
         self.depth_spin.setValue(500)
@@ -159,16 +159,17 @@ class PipelineWindow(QMainWindow):
         depth_row = QHBoxLayout()
         depth_row.addWidget(self.depth_check)
         depth_row.addWidget(self.depth_spin, stretch=1)
-        form.addRow("Depth filter:", self._wrap(depth_row))
+        form.addRow("Filtro de profundidade:", self._wrap(depth_row))
 
         self.save_npz_check = QCheckBox(
-            "Save .npz label maps (background_difference_watershed/)"
+            "Salvar mapas de rótulos .npz (background_difference_watershed/)"
         )
         self.save_npz_check.setChecked(True)
         form.addRow("", self.save_npz_check)
 
         self.save_sbs_check = QCheckBox(
-            "Save side-by-side preview (background_difference_watershed_side_by_side/)"
+            "Salvar pré-visualização lado a lado "
+            "(background_difference_watershed_side_by_side/)"
         )
         self.save_sbs_check.setChecked(True)
         form.addRow("", self.save_sbs_check)
@@ -178,7 +179,9 @@ class PipelineWindow(QMainWindow):
         group = QGroupBox("Feret")
         form = QFormLayout(group)
 
-        self.feret_check = QCheckBox("Compute Feret diameters (CSV in date folder)")
+        self.feret_check = QCheckBox(
+            "Calcular diâmetros de Feret (CSV na pasta da data)"
+        )
         self.feret_check.setChecked(True)
         form.addRow("", self.feret_check)
 
@@ -186,37 +189,37 @@ class PipelineWindow(QMainWindow):
         self.um_per_pixel_spin.setDecimals(4)
         self.um_per_pixel_spin.setRange(0.0001, 1_000_000.0)
         self.um_per_pixel_spin.setValue(13.8)
-        form.addRow("Micrometers per pixel:", self.um_per_pixel_spin)
+        form.addRow("Micrômetros por pixel:", self.um_per_pixel_spin)
 
         self.edge_strip_spin = QSpinBox()
         self.edge_strip_spin.setRange(0, 10_000)
         self.edge_strip_spin.setValue(2)
-        form.addRow("Edge strip (px):", self.edge_strip_spin)
+        form.addRow("Faixa de borda (px):", self.edge_strip_spin)
         return group
 
     def _build_roi_group(self) -> QGroupBox:
-        group = QGroupBox("ROI extraction")
+        group = QGroupBox("Extração de ROI")
         form = QFormLayout(group)
 
         self.roi_border_spin = QSpinBox()
         self.roi_border_spin.setRange(0, 10_000)
         self.roi_border_spin.setValue(10)
-        form.addRow("ROI border (px):", self.roi_border_spin)
+        form.addRow("Borda da ROI (px):", self.roi_border_spin)
 
         self.roi_max_coverage_spin = QDoubleSpinBox()
         self.roi_max_coverage_spin.setDecimals(4)
         self.roi_max_coverage_spin.setRange(0.0001, 1.0)
         self.roi_max_coverage_spin.setSingleStep(0.01)
         self.roi_max_coverage_spin.setValue(0.98)
-        form.addRow("ROI max coverage:", self.roi_max_coverage_spin)
+        form.addRow("Cobertura máxima da ROI:", self.roi_max_coverage_spin)
         return group
 
     def _build_action_bar(self) -> QHBoxLayout:
         bar = QHBoxLayout()
-        self.status_label = QLabel("Ready")
-        self.run_button = QPushButton("Run pipeline")
+        self.status_label = QLabel("Pronto")
+        self.run_button = QPushButton("Executar pipeline")
         self.run_button.clicked.connect(self._start_pipeline)
-        self.stop_button = QPushButton("Stop")
+        self.stop_button = QPushButton("Parar")
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self._stop_pipeline)
         bar.addWidget(self.status_label, stretch=1)
@@ -228,7 +231,7 @@ class PipelineWindow(QMainWindow):
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setFont(QFont("Monospace", 9))
-        self.log_view.setPlaceholderText("Pipeline output appears here…")
+        self.log_view.setPlaceholderText("A saída do pipeline aparece aqui…")
         return self.log_view
 
     @staticmethod
@@ -242,7 +245,7 @@ class PipelineWindow(QMainWindow):
     def _pick_campaign(self) -> None:
         start = self.campaign_edit.text().strip() or str(REPO)
         chosen = QFileDialog.getExistingDirectory(
-            self, "Select campaign folder", start
+            self, "Selecionar pasta da campanha", start
         )
         if chosen:
             self.campaign_edit.setText(chosen)
@@ -250,7 +253,7 @@ class PipelineWindow(QMainWindow):
     def _pick_output_base(self) -> None:
         start = self.output_edit.text().strip() or str(REPO)
         chosen = QFileDialog.getExistingDirectory(
-            self, "Select output base folder", start
+            self, "Selecionar pasta base de saída", start
         )
         if chosen:
             self.output_edit.setText(chosen)
@@ -311,18 +314,20 @@ class PipelineWindow(QMainWindow):
         campaign_text = self.campaign_edit.text().strip()
         if not campaign_text:
             QMessageBox.warning(
-                self, "Missing folder", "Please choose a campaign folder."
+                self, "Pasta ausente", "Escolha uma pasta de campanha."
             )
             return
         campaign = Path(campaign_text)
         if not campaign.is_dir():
             QMessageBox.warning(
-                self, "Invalid folder", f"Not a directory:\n{campaign}"
+                self, "Pasta inválida", f"Não é um diretório:\n{campaign}"
             )
             return
         if not PIPELINE_SCRIPT.is_file():
             QMessageBox.critical(
-                self, "Missing script", f"Cannot find:\n{PIPELINE_SCRIPT}"
+                self,
+                "Script ausente",
+                f"Não foi possível encontrar:\n{PIPELINE_SCRIPT}",
             )
             return
 
@@ -330,8 +335,8 @@ class PipelineWindow(QMainWindow):
         if not dates:
             QMessageBox.warning(
                 self,
-                "No dates found",
-                f"No date subfolders with images under:\n{campaign}",
+                "Nenhuma data encontrada",
+                f"Não há subpastas de data com imagens em:\n{campaign}",
             )
             return
 
@@ -343,8 +348,9 @@ class PipelineWindow(QMainWindow):
         except OSError as e:
             QMessageBox.critical(
                 self,
-                "Output error",
-                f"Could not create campaign output folder:\n{campaign_out}\n\n{e}",
+                "Erro de saída",
+                f"Não foi possível criar a pasta de saída da campanha:\n"
+                f"{campaign_out}\n\n{e}",
             )
             return
 
@@ -353,8 +359,8 @@ class PipelineWindow(QMainWindow):
         self._date_index = 0
         self.log_view.clear()
         self._append_log(
-            f"Campaign: {campaign}\n"
-            f"Dates: {len(self._date_queue)} → {campaign_out}/\n"
+            f"Campanha: {campaign}\n"
+            f"Datas: {len(self._date_queue)} → {campaign_out}/\n"
         )
         self._set_running(True)
         self._start_next_date()
@@ -362,9 +368,9 @@ class PipelineWindow(QMainWindow):
     def _start_next_date(self) -> None:
         if self._date_index >= len(self._date_queue):
             self.status_label.setText(
-                f"Finished successfully → {self._campaign_name}"
+                f"Concluído com sucesso → {self._campaign_name}"
             )
-            self._append_log("\n[campaign finished]\n")
+            self._append_log("\n[campanha concluída]\n")
             self._process = None
             self._run_dir = None
             self._set_running(False)
@@ -376,8 +382,8 @@ class PipelineWindow(QMainWindow):
         try:
             run_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            self._append_log(f"\nERROR creating {run_dir}: {e}\n")
-            self.status_label.setText(f"Failed → {run_dir.name}")
+            self._append_log(f"\nERRO ao criar {run_dir}: {e}\n")
+            self.status_label.setText(f"Falhou → {run_dir.name}")
             self._process = None
             self._set_running(False)
             return
@@ -387,7 +393,7 @@ class PipelineWindow(QMainWindow):
         progress = f"{self._date_index + 1}/{len(self._date_queue)}"
         self._append_log(f"\n=== {label} ({progress}) → {run_dir} ===\n")
         if "--skip-existing" in args:
-            self._append_log("(skip-existing enabled)\n")
+            self._append_log("(ignorar existentes ativado)\n")
         self._append_log(f"$ {sys.executable} {' '.join(args)}\n")
 
         process = QProcess(self)
@@ -399,13 +405,13 @@ class PipelineWindow(QMainWindow):
         process.finished.connect(self._on_finished)
         process.errorOccurred.connect(self._on_error)
         self._process = process
-        self.status_label.setText(f"Running… → {label} ({progress})")
+        self.status_label.setText(f"Em execução… → {label} ({progress})")
         process.start()
 
     def _stop_pipeline(self) -> None:
         if self._process is None:
             return
-        self.status_label.setText("Stopping…")
+        self.status_label.setText("Parando…")
         # Drop remaining dates so finish handler does not continue.
         self._date_queue = self._date_queue[: self._date_index + 1]
         self._process.kill()
@@ -430,12 +436,12 @@ class PipelineWindow(QMainWindow):
     def _on_finished(self, exit_code: int, _status: object) -> None:
         date_name = self._run_dir.name if self._run_dir is not None else ""
         self._append_log(
-            f"\n[date finished: {date_name}, exit code {exit_code}]\n"
+            f"\n[data concluída: {date_name}, código de saída {exit_code}]\n"
         )
         self._process = None
         if exit_code != 0:
             self.status_label.setText(
-                f"Failed (exit code {exit_code}) → "
+                f"Falhou (código de saída {exit_code}) → "
                 f"{self._campaign_name}/{date_name}"
             )
             self._set_running(False)
@@ -446,7 +452,7 @@ class PipelineWindow(QMainWindow):
     def _on_error(self, _error: object) -> None:
         if self._process is None:
             return
-        self._append_log("\n[failed to start process]\n")
+        self._append_log("\n[falha ao iniciar o processo]\n")
 
     # ----------------------------------------------------------------- helpers
     def _append_log(self, text: str) -> None:

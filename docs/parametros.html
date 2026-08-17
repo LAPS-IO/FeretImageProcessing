@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Parâmetros da GUI — FeretImageProcessing</title>
+  <style>
+    :root {
+      --bg: #f6f4ef;
+      --card: #ffffff;
+      --ink: #1c1b19;
+      --muted: #5c574f;
+      --line: #d9d3c7;
+      --accent: #0b5f4b;
+      --accent-soft: #e5f3ef;
+      --code: #2a2926;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(1200px 500px at 10% -10%, #e8f2ee 0%, transparent 55%),
+        radial-gradient(900px 400px at 100% 0%, #f0ebe0 0%, transparent 50%),
+        var(--bg);
+      line-height: 1.55;
+    }
+
+    main {
+      max-width: 820px;
+      margin: 0 auto;
+      padding: 2.5rem 1.25rem 4rem;
+    }
+
+    h1 {
+      font-size: 1.85rem;
+      margin: 0 0 0.4rem;
+      letter-spacing: -0.02em;
+    }
+
+    .lead {
+      color: var(--muted);
+      margin: 0 0 1.75rem;
+      max-width: 62ch;
+    }
+
+    .toc {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 1rem 1.25rem;
+      margin-bottom: 2rem;
+    }
+
+    .toc h2 {
+      font-size: 0.95rem;
+      margin: 0 0 0.6rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+    }
+
+    .toc ol {
+      margin: 0;
+      padding-left: 1.25rem;
+    }
+
+    .toc a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    .toc a:hover { text-decoration: underline; }
+
+    section {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 1.25rem 1.35rem 0.5rem;
+      margin-bottom: 1.25rem;
+    }
+
+    section > h2 {
+      margin: 0 0 0.35rem;
+      font-size: 1.25rem;
+      color: var(--accent);
+    }
+
+    section > .section-note {
+      color: var(--muted);
+      font-size: 0.95rem;
+      margin: 0 0 1rem;
+    }
+
+    .param {
+      border-top: 1px solid var(--line);
+      padding: 1rem 0;
+    }
+
+    .param:first-of-type { border-top: none; }
+
+    .param h3 {
+      margin: 0 0 0.35rem;
+      font-size: 1.05rem;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem 0.75rem;
+      margin: 0 0 0.55rem;
+      font-size: 0.85rem;
+    }
+
+    .meta span {
+      background: var(--accent-soft);
+      color: var(--accent);
+      border-radius: 999px;
+      padding: 0.15rem 0.65rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .param p {
+      margin: 0 0 0.5rem;
+    }
+
+    .param p:last-child { margin-bottom: 0; }
+
+    code, .path {
+      font-family: ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace;
+      font-size: 0.9em;
+      background: #f0eee8;
+      color: var(--code);
+      padding: 0.05em 0.35em;
+      border-radius: 4px;
+    }
+
+    .note {
+      background: #fff8e8;
+      border-left: 3px solid #c9a33a;
+      padding: 0.75rem 1rem;
+      margin: 1.5rem 0 0;
+      border-radius: 0 8px 8px 0;
+      color: #4a3d1f;
+    }
+
+    footer {
+      margin-top: 1.5rem;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Parâmetros da GUI</h1>
+    <p class="lead">
+      Referência dos campos da interface <code>pipeline_gui.py</code>.
+      Cada execução processa todas as subpastas de data de uma campanha e grava
+      os resultados em <code>&lt;base_saída&gt;/&lt;campanha&gt;/&lt;data&gt;/</code>.
+    </p>
+
+    <nav class="toc" aria-label="Índice">
+      <h2>Índice</h2>
+      <ol>
+        <li><a href="#entrada-saida">Entrada / Saída</a></li>
+        <li><a href="#segmentacao">Segmentação</a></li>
+        <li><a href="#feret">Feret</a></li>
+        <li><a href="#roi">Extração de ROI</a></li>
+        <li><a href="#acoes">Ações</a></li>
+      </ol>
+    </nav>
+
+    <section id="entrada-saida">
+      <h2>Entrada / Saída</h2>
+      <p class="section-note">Define de onde vêm as imagens e para onde vão os resultados.</p>
+
+      <article class="param">
+        <h3>Pasta da campanha</h3>
+        <div class="meta"><span>obrigatório</span></div>
+        <p>
+          Pasta raiz da campanha. O layout esperado é
+          <code>campanha/data/frames/imagens</code>: cada subpasta direta
+          (data) é processada se contiver ao menos uma imagem.
+        </p>
+      </article>
+
+      <article class="param">
+        <h3>Pasta base de saída</h3>
+        <div class="meta"><span>padrão: <code>outputs/</code></span></div>
+        <p>
+          Diretório base onde a GUI cria
+          <code>&lt;campanha&gt;/&lt;data&gt;/</code> para cada data.
+          Dentro de cada pasta de data ficam, conforme as opções marcadas:
+          <code>roi_crops/</code>, <code>background_difference_watershed/</code>,
+          <code>background_difference_watershed_side_by_side/</code> e
+          <code>feret_diameters.csv</code>.
+        </p>
+      </article>
+
+      <article class="param">
+        <h3>Ignorar imagens já presentes em outputs/&lt;campanha&gt;/&lt;data&gt;</h3>
+        <div class="meta"><span>padrão: ligado</span></div>
+        <p>
+          Se a pasta de saída da data <strong>já existia</strong> antes desta
+          execução, o pipeline pula imagens que já têm resultado correspondente
+          (<code>--skip-existing</code>). Em pastas novas, tudo é processado
+          mesmo com a opção marcada.
+        </p>
+      </article>
+
+      <article class="param">
+        <h3>Saída detalhada (verbose)</h3>
+        <div class="meta"><span>padrão: ligado</span></div>
+        <p>
+          Mostra progresso por pasta/imagem no painel de log da GUI
+          (útil para acompanhar execuções longas).
+        </p>
+      </article>
+    </section>
+
+    <section id="segmentacao">
+      <h2>Segmentação</h2>
+      <p class="section-note">
+        Diferença em relação ao fundo (rolling) e watershed para separar
+        componentes nas imagens.
+      </p>
+
+      <article class="param">
+        <h3>Largura rolling</h3>
+        <div class="meta">
+          <span>padrão: 5</span>
+          <span>faixa: 1–999</span>
+        </div>
+        <p>
+          Número de frames vizinhos de cada lado usados para montar o fundo
+          da imagem atual (média dos <em>W</em> anteriores + <em>W</em>
+          seguintes na mesma pasta). Valores maiores suavizam o fundo, mas
+          podem misturar objetos que se movem pouco.
+        </p>
+      </article>
+
+      <article class="param">
+        <h3>Limiar watershed</h3>
+        <div class="meta">
+          <span>padrão: 4</span>
+          <span>faixa: 0–255</span>
+        </div>
+        <p>
+          Limiar no canal de cinza da diferença imagem−fundo. Pixels com
+          diferença &gt; limiar viram sementes de primeiro plano; diferença 0
+          é fundo. Limiar baixo detecta mais objetos (e mais ruído); limiar
+          alto é mais seletivo.
+        </p>
+      </article>
+
+      <article class="param">
+        <h3>Área mínima watershed (px)</h3>
+        <div class="meta">
+          <span>padrão: 250</span>
+          <span>faixa: ≥ 0</span>
+        </div>
+        <p>
+          Após a segmentação, remove instâncias com menos pixels que este
+          valor. Use 0 para não filtrar por área. Valores altos eliminam
+          detritos pequenos e ruído.
+        </p>
+      </article>
+
+      <article class="param">
+        <h3>Raio morfologia circular</h3>
+        <div class="meta">
+          <span>padrão: 11</span>
+          <span>faixa: ≥ 1</span>
+        </div>
+        <p>
+          Raio do elemento estruturante circular usado em dilatação seguida
+          de erosão no mapa binário derivado dos rótulos. Ajuda a fechar
+          buracos e suavizar bordas dos objetos segmentados.
+        </p>
+      </article>
+
+      <article class="param">
+        <h3>Filtro de profundidade</h3>
+        <div class="meta">
+          <span>padrão: ligado, 500</span>
+        </div>
+        <p>
+          Quando ligado, só processa imagens cujo nome contém a marca de
+          profundidade <code>_&lt;sinal&gt;&lt;7 dígitos&gt;.&lt;ext&gt;</code>
+          (ex.: <code>..._+0000512.jpg</code>) e cuja profundidade é
+          <strong>estritamente maior</strong> que o valor informado.
+          Imagens sem marca de profundidade no nome são sempre processadas.
+          Desmarque a caixa para desativar o filtro.
+        </p>
+      </article>
+
+      <article class="param">
+        <h3>Salvar mapas de rótulos .npz</h3>
+        <div class="meta"><span>padrão: ligado</span></div>
+        <p>
+          Grava os mapas de segmentação em
+          <code>background_difference_watershed/</code> dentro da pasta da
+          data. Necessário se quiser reutilizar a segmentação depois
+          (Feret, ROI, etc.).
+        </p>
+      </article>
+
+      <article class="param">
+        <h3>Salvar pré-visualização lado a lado</h3>
+        <div class="meta"><span>padrão: ligado</span></div>
+        <p>
+          Grava imagens de conferência (original + segmentação) em
+          <code>background_difference_watershed_side_by_side/</code>.
+          Útil para inspecionar visualmente o resultado; ocupa espaço em
+          disco.
+        </p>
+      </article>
+    </section>
+
+    <section id="feret">
+      <h2>Feret</h2>
+      <p class="section-note">
+        Mede o diâmetro máximo de Feret de cada componente segmentado.
+      </p>
+
+      <article class="param">
+        <h3>Calcular diâmetros de Feret</h3>
+        <div class="meta"><span>padrão: ligado</span></div>
+        <p>
+          Se marcado, gera <code>feret_diameters.csv</code> na pasta da data,
+          com datetime, nome do arquivo, profundidade, bounding box e
+          diâmetros em pixels e em micrômetros.
+        </p>
+      </article>
+
+      <article class="param">
+        <h3>Micrômetros por pixel</h3>
+        <div class="meta">
+          <span>padrão: 13,8</span>
+          <span>usado só se Feret estiver ligado</span>
+        </div>
+        <p>
+          Escala física: <code>diâmetro_µm = diâmetro_px × este valor</code>.
+          Ajuste conforme a calibração da câmera/óptica.
+        </p>
+      </article>
+
+      <article class="param">
+        <h3>Faixa de borda (px)</h3>
+        <div class="meta">
+          <span>padrão: 2</span>
+          <span>usado só se Feret estiver ligado</span>
+        </div>
+        <p>
+          Antes de medir o Feret, zera uma faixa de <em>P</em> pixels nas
+          bordas da imagem. Evita que artefatos ou objetos cortados na
+          margem distorçam as medidas.
+        </p>
+      </article>
+    </section>
+
+    <section id="roi">
+      <h2>Extração de ROI</h2>
+      <p class="section-note">
+        Recorta cada componente externo (não aninhado) e salva em
+        <code>roi_crops/</code>.
+      </p>
+
+      <article class="param">
+        <h3>Borda da ROI (px)</h3>
+        <div class="meta">
+          <span>padrão: 10</span>
+          <span>faixa: ≥ 0</span>
+        </div>
+        <p>
+          Margem em pixels adicionada em cada lado da caixa delimitadora do
+          componente, limitada pelos limites da imagem. Mais borda = mais
+          contexto ao redor do objeto.
+        </p>
+      </article>
+
+      <article class="param">
+        <h3>Cobertura máxima da ROI</h3>
+        <div class="meta">
+          <span>padrão: 0,98</span>
+          <span>faixa: 0,0001–1,0</span>
+        </div>
+        <p>
+          Descarta componentes cuja caixa cobre uma fração ≥ este valor
+          <strong>nas duas</strong> dimensões (largura e altura) da imagem.
+          Serve para não extrair o “componente da imagem inteira”. Valor
+          próximo de 1 é mais permissivo; valor menor rejeita caixas grandes
+          com mais rigor.
+        </p>
+      </article>
+    </section>
+
+    <section id="acoes">
+      <h2>Ações</h2>
+
+      <article class="param">
+        <h3>Executar pipeline</h3>
+        <p>
+          Enfileira todas as datas da campanha e chama
+          <code>segment_and_extract_rois.py</code> para cada uma, com os
+          parâmetros acima. O status e o log mostram o progresso
+          (<code>data atual / total</code>).
+        </p>
+      </article>
+
+      <article class="param">
+        <h3>Parar</h3>
+        <p>
+          Interrompe o processo em andamento e cancela as datas restantes da
+          fila.
+        </p>
+      </article>
+    </section>
+
+    <p class="note">
+      <strong>Dica:</strong> para campanhas grandes, mantenha o filtro de
+      profundidade e “ignorar imagens já presentes” ligados, e use o verbose
+      para acompanhar. Desative a pré-visualização lado a lado se precisar
+      economizar disco.
+    </p>
+
+    <footer>
+      Documentação dos parâmetros da GUI · FeretImageProcessing
+    </footer>
+  </main>
+</body>
+</html>
