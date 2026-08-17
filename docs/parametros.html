@@ -238,8 +238,8 @@
         <p>
           Número de frames vizinhos de cada lado usados para montar o fundo
           da imagem atual (média dos <em>W</em> anteriores + <em>W</em>
-          seguintes na mesma pasta). Valores maiores suavizam o fundo, mas
-          podem misturar objetos que se movem pouco.
+          seguintes na mesma pasta). Valores maiores podem melhorar o resultado, mas
+          demoram mais para processar.
         </p>
       </article>
 
@@ -253,7 +253,7 @@
           Limiar no canal de cinza da diferença imagem−fundo. Pixels com
           diferença &gt; limiar viram sementes de primeiro plano; diferença 0
           é fundo. Limiar baixo detecta mais objetos (e mais ruído); limiar
-          alto é mais seletivo.
+          alto é mais seletivo. Use valores baixos para imagens com baixo contraste.
         </p>
       </article>
 
