@@ -17,7 +17,6 @@ Abra um terminal na pasta `FeretImageProcessing` e execute, na ordem:
 ### 1. Criar o ambiente virtual
 
 ```bash
-cd ~/Documentos/Programas/FeretImageProcessing
 python3 -m venv .venv
 ```
 
