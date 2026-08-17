@@ -1,6 +1,5 @@
 inputs/
 outputs/
 .*
-*.sh
 !.gitignore
 __pycache__/
