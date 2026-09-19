@@ -238,7 +238,7 @@ class PostprocessWindow(QMainWindow):
         self.samples_check = QCheckBox(
             f"Gerar 180 ROIs aleatórios em {SAMPLES_DIR}/ (18 por página)"
         )
-        self.samples_check.setChecked(True)
+        self.samples_check.setChecked(False)
         form.addRow("", self.samples_check)
 
         self.verbose_check = QCheckBox("Saída detalhada no log")
