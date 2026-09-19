@@ -46,11 +46,14 @@ from PyQt5.QtWidgets import (
 prefer_pyqt5_platform_plugins()
 
 from atributos_por_roi import (
-    OUTPUT_CSV_NAME,
     OUTPUT_LOG_NAME,
     ProcessingCancelled,
     discover_run_dirs,
     process_paths,
+)
+from generate_roi_samples import (
+    SAMPLES_DIR,
+    process_run as generate_roi_sample_sheets,
 )
 
 prefer_pyqt5_platform_plugins()
@@ -70,6 +73,7 @@ class Worker(QObject):
         images_root: Path | None,
         border: int | None,
         skip_existing: bool,
+        generate_samples: bool,
         verbose: bool,
     ) -> None:
         super().__init__()
@@ -77,6 +81,7 @@ class Worker(QObject):
         self.images_root = images_root
         self.border = border
         self.skip_existing = skip_existing
+        self.generate_samples = generate_samples
         self.verbose = verbose
         self._stop = False
 
@@ -98,6 +103,10 @@ class Worker(QObject):
             n_skipped = 0
             n_done = 0
             for run_dir, csv_path, n_rows, unmatched, skipped in results:
+                if self._stop:
+                    raise ProcessingCancelled(
+                        "Processamento interrompido pelo usuário."
+                    )
                 if skipped:
                     n_skipped += 1
                     msg = (
@@ -112,10 +121,28 @@ class Worker(QObject):
                     )
                 lines.append(msg)
                 self.log.emit(msg + "\n")
+
+                if self.generate_samples:
+                    self.log.emit(
+                        f"{run_dir.name}: gerando amostras em {SAMPLES_DIR}/ …\n"
+                    )
+                    out_samples = generate_roi_sample_sheets(
+                        run_dir,
+                        n_samples=180,
+                        per_page=18,
+                        cols=6,
+                        rows=3,
+                        seed=None,
+                        verbose=False,
+                    )
+                    self.log.emit(f"  → {out_samples}\n")
+
             summary = (
                 f"Concluído: {len(results)} run(s) "
                 f"({n_done} processada(s), {n_skipped} ignorada(s))."
             )
+            if self.generate_samples:
+                summary += f"\nAmostras: {SAMPLES_DIR}/ (180 ROIs, 18/página)."
             if lines:
                 summary += "\n" + "\n".join(lines)
             self.finished_ok.emit(summary)
@@ -207,6 +234,12 @@ class PostprocessWindow(QMainWindow):
         )
         self.skip_existing_check.setChecked(True)
         form.addRow("", self.skip_existing_check)
+
+        self.samples_check = QCheckBox(
+            f"Gerar 180 ROIs aleatórios em {SAMPLES_DIR}/ (18 por página)"
+        )
+        self.samples_check.setChecked(True)
+        form.addRow("", self.samples_check)
 
         self.verbose_check = QCheckBox("Saída detalhada no log")
         self.verbose_check.setChecked(True)
@@ -332,6 +365,7 @@ class PostprocessWindow(QMainWindow):
             images_root,
             border,
             self.skip_existing_check.isChecked(),
+            self.samples_check.isChecked(),
             self.verbose_check.isChecked(),
         )
         worker.moveToThread(thread)

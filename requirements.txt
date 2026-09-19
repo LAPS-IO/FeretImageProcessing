@@ -6,5 +6,8 @@ opencv-python>=4.11
 # Optional: progress bars in feret.py / extract_rois.py (falls back to no-op if missing)
 tqdm>=4.66
 
-# GUI front-end (pipeline_gui.py)
+# GUI front-end (pipeline_gui.py / postprocess_gui.py)
 PyQt5>=5.15
+
+# ROI sample sheets (generate_roi_samples.py)
+matplotlib>=3.8
