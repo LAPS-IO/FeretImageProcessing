@@ -15,6 +15,7 @@ import re
 import sys
 import zipfile
 import zlib
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +43,10 @@ LABEL_INSTANCE_MIN = 2
 LABEL_INSTANCE_MAX = 65534
 # Local-background ring: elliptical SE of size K×K (K = 2*radius+1).
 BG_DILATE_RADIUS = 4  # → kernel 9×9
+# ROIs are visited grouped by source frame, so caching a couple of frames is
+# enough to avoid re-reading them; more than that only wastes memory (labels
+# ~6 MB + gray ~12 MB per 1536×2048 frame).
+CACHE_MAX_FRAMES = 2
 
 
 class ProcessingCancelled(Exception):
@@ -178,17 +183,41 @@ def _optional_int(value: object) -> Optional[int]:
         return None
 
 
+class LruCache:
+    """Minimal ``key → value`` LRU, used to bound per-frame array caches."""
+
+    def __init__(self, maxsize: int) -> None:
+        self.maxsize = max(1, int(maxsize))
+        self._data: "OrderedDict[object, object]" = OrderedDict()
+
+    def get(self, key: object, default: object = None) -> object:
+        if key not in self._data:
+            return default
+        self._data.move_to_end(key)
+        return self._data[key]
+
+    def put(self, key: object, value: object) -> None:
+        self._data[key] = value
+        self._data.move_to_end(key)
+        while len(self._data) > self.maxsize:
+            self._data.popitem(last=False)
+
+    def clear(self) -> None:
+        self._data.clear()
+
+
 def load_labels(npz_path: Path) -> Optional[np.ndarray]:
     try:
-        data = np.load(npz_path)
-        if "labels" not in data.files:
-            return None
-        lab = np.asarray(data["labels"])
-        if lab.ndim != 2:
-            return None
-        return lab
+        # ``with`` closes the zip handle; the array is already materialised.
+        with np.load(npz_path) as data:
+            if "labels" not in data.files:
+                return None
+            lab = np.asarray(data["labels"])
     except (zipfile.BadZipFile, zlib.error, EOFError, OSError, ValueError):
         return None
+    if lab.ndim != 2:
+        return None
+    return lab
 
 
 def find_npz_for_crop(
@@ -683,10 +712,10 @@ def _process_run_body(
 
     feret_index = load_feret_index(run_dir / FERET_CSV_NAME)
 
-    # Cache labels / gray / bbox index per source image
-    labels_cache: Dict[Path, Optional[np.ndarray]] = {}
-    gray_cache: Dict[Path, Optional[np.ndarray]] = {}
-    bbox_index_cache: Dict[Path, Dict[Tuple[int, int], Tuple[int, int, int]]] = {}
+    # Labels/bbox index and grayscale of the most recent source frames only:
+    # crops are iterated in sorted order, so they come grouped by frame.
+    labels_cache = LruCache(CACHE_MAX_FRAMES)
+    gray_cache = LruCache(CACHE_MAX_FRAMES)
 
     rows_out: List[Dict[str, object]] = []
     unmatched = 0
@@ -725,16 +754,15 @@ def _process_run_body(
             else None
         )
         if npz_path is not None:
-            if npz_path not in labels_cache:
-                labels_cache[npz_path] = load_labels(npz_path)
-                lab0 = labels_cache[npz_path]
-                if lab0 is not None:
-                    bbox_index_cache[npz_path] = bbox_top_left_index(lab0)
-            labels = labels_cache[npz_path]
+            entry = labels_cache.get(npz_path)
+            if entry is None:
+                lab0 = load_labels(npz_path)
+                index = bbox_top_left_index(lab0) if lab0 is not None else {}
+                entry = (lab0, index)
+                labels_cache.put(npz_path, entry)
+            labels, bbox_index = entry
             if labels is not None:
-                comp = lookup_component(
-                    bbox_index_cache.get(npz_path, {}), labels, left, top
-                )
+                comp = lookup_component(bbox_index, labels, left, top)
                 if comp is not None:
                     label_id, idx_bottom, idx_right = comp
                     # Prefer Feret CSV bbox; fall back to mask bbox from the index.
@@ -745,10 +773,11 @@ def _process_run_body(
                         images_root, crops_root, crop_path, image_stem
                     )
                     if src is not None:
-                        if src not in gray_cache:
+                        gray_entry = gray_cache.get(src)
+                        if gray_entry is None:
                             img = cv2.imread(str(src), cv2.IMREAD_UNCHANGED)
                             if img is None:
-                                gray_cache[src] = None
+                                g = None
                             else:
                                 g = _to_gray_f32(img)
                                 if g.shape[:2] != labels.shape:
@@ -757,8 +786,9 @@ def _process_run_body(
                                         (labels.shape[1], labels.shape[0]),
                                         interpolation=cv2.INTER_LINEAR,
                                     )
-                                gray_cache[src] = g
-                        gray_full = gray_cache[src]
+                            gray_entry = (g,)
+                            gray_cache.put(src, gray_entry)
+                        gray_full = gray_entry[0]
                     crop_bgr = None
                     if gray_full is None:
                         crop_bgr = cv2.imread(str(crop_path), cv2.IMREAD_UNCHANGED)
